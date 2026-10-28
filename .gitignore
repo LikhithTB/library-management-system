@@ -1,0 +1,25 @@
+# dependencies and build output
+node_modules/
+build/
+venv/
+__pycache__/
+*.pyc
+
+# secrets and local config (never commit real keys)
+.env
+.env.*
+!.env.example
+
+# database dumps (contain real user data)
+library_backup.*
+*.dump
+*.bak
+
+# scratch work
+merge-conflict-practice/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

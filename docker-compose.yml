@@ -1,0 +1,54 @@
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: library-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-0567}
+      POSTGRES_DB: ${POSTGRES_DB:-library_db}
+    volumes:
+      - library_db_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-library_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+    container_name: library-backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-0567}@db:5432/${POSTGRES_DB:-library_db}
+      CHATBOT_DB_PASSWORD: ${CHATBOT_DB_PASSWORD:-chatbot_dev_only}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_CHATBOT_MODEL: ${OPENAI_CHATBOT_MODEL:-gpt-4.1-nano}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/chatbot/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  frontend:
+    build:
+      context: .
+    container_name: library-frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "3000:80"
+
+volumes:
+  library_db_data:
