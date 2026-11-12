@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import APIRouter, FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
@@ -25,7 +25,12 @@ import io
 
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title=APP_NAME)
+# Interactive docs and the schema are not served (they list every endpoint).
+app = FastAPI(title=APP_NAME, docs_url=None, redoc_url=None, openapi_url=None)
+
+# Every route on `api` requires a valid, approved login. Only register and
+# login stay on `app` directly. Role/ownership checks sit on each handler.
+api = APIRouter(dependencies=[Depends(auth.get_current_user)])
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,6 +49,17 @@ RESERVATION_WINDOW_HOURS = 24
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+def lock_book_and_copy(db: Session, copy_code: str):
+    """Locks the copy's book row, then the copy row. Concurrent issue, return,
+    renew and reserve calls queue up here instead of racing. Always lock the
+    book first, so the order never changes and deadlocks can't happen."""
+    row = db.query(models.BookCopy.book_id).filter(models.BookCopy.copy_code == copy_code).first()
+    if not row:
+        return None
+    db.query(models.Book).filter(models.Book.id == row.book_id).with_for_update().populate_existing().first()
+    return db.query(models.BookCopy).filter(models.BookCopy.copy_code == copy_code).with_for_update().populate_existing().first()
+
 
 def detect_role_from_email(email: str):
     if STUDENT_EMAIL_IDENTIFIER in email:
@@ -216,8 +232,6 @@ def check_and_apply_graduation_expiry(db: Session, user: "models.User"):
     year_end = datetime(user.graduation_year, 12, 31, 23, 59, 59)
     if datetime.utcnow() > year_end:
         disable_student_account(db, user, AccountStatus.graduated, f"graduation year {user.graduation_year} ended")
-        for copy in expired:
-            notify_next_in_queue(copy.book_id, copy.book.available_copies, db)
 
 
 def notify_next_in_queue(book_id: int, available_count: int, db: Session):
@@ -307,9 +321,17 @@ def register(req: schemas.RegisterRequest, db: Session = Depends(get_db)):
 
 @app.post("/api/login", response_model=schemas.TokenResponse)
 def login(req: schemas.LoginRequest, db: Session = Depends(get_db)):
+    rate_key = req.roll_number.strip().lower()
+    auth.ensure_login_allowed(rate_key)
     user = db.query(models.User).filter(models.User.roll_number == req.roll_number).first()
     if not user or not auth.verify_password(req.password, user.hashed_password):
+        auth.record_login_failure(rate_key)
         raise HTTPException(status_code=401, detail="Invalid username or password")
+    auth.clear_login_failures(rate_key)
+    if not auth.is_hashed(user.hashed_password):
+        # Legacy plaintext row: upgrade it now that we hold the correct password.
+        user.hashed_password = auth.hash_password(req.password)
+        db.commit()
     if user.approval_status == ApprovalStatus.rejected:
         raise HTTPException(status_code=403, detail="rejected")
     if not user.is_approved:
@@ -339,7 +361,7 @@ def login(req: schemas.LoginRequest, db: Session = Depends(get_db)):
 # Student — one-time graduation year
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.post("/api/student/graduation-year")
+@api.post("/api/student/graduation-year")
 def submit_graduation_year(req: schemas.GraduationYearSubmit, db: Session = Depends(get_db)):
     user = db.query(models.User).filter(models.User.id == req.user_id).first()
     if not user:
@@ -363,7 +385,7 @@ def submit_graduation_year(req: schemas.GraduationYearSubmit, db: Session = Depe
 # HOD approves librarian / staff
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.get("/api/hod/pending-users", response_model=list[schemas.UserOut])
+@api.get("/api/hod/pending-users", dependencies=[Depends(auth.require_roles(RoleEnum.hod))], response_model=list[schemas.UserOut])
 def hod_pending_users(db: Session = Depends(get_db)):
     return db.query(models.User).filter(
         models.User.approval_status == ApprovalStatus.pending,
@@ -371,7 +393,7 @@ def hod_pending_users(db: Session = Depends(get_db)):
     ).all()
 
 
-@app.post("/api/hod/approve-user")
+@api.post("/api/hod/approve-user", dependencies=[Depends(auth.require_roles(RoleEnum.hod))])
 def hod_approve_user(action: schemas.ApprovalAction, db: Session = Depends(get_db)):
     user = db.query(models.User).filter(models.User.id == action.user_id).first()
     if not user:
@@ -394,7 +416,7 @@ def hod_approve_user(action: schemas.ApprovalAction, db: Session = Depends(get_d
 # Admin approves HOD / librarian / staff
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.get("/api/admin/pending-users", response_model=list[schemas.UserOut])
+@api.get("/api/admin/pending-users", dependencies=[Depends(auth.require_roles(RoleEnum.admin))], response_model=list[schemas.UserOut])
 def admin_pending_users(db: Session = Depends(get_db)):
     return db.query(models.User).filter(
         models.User.approval_status == ApprovalStatus.pending,
@@ -402,7 +424,7 @@ def admin_pending_users(db: Session = Depends(get_db)):
     ).all()
 
 
-@app.post("/api/admin/approve-user")
+@api.post("/api/admin/approve-user", dependencies=[Depends(auth.require_roles(RoleEnum.admin))])
 def admin_approve_user(action: schemas.ApprovalAction, db: Session = Depends(get_db)):
     user = db.query(models.User).filter(models.User.id == action.user_id).first()
     if not user:
@@ -425,7 +447,7 @@ def admin_approve_user(action: schemas.ApprovalAction, db: Session = Depends(get
 # Admin — student account status (active / graduated / dropped / suspended)
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.get("/api/admin/students/{roll_number}/account-status")
+@api.get("/api/admin/students/{roll_number}/account-status", dependencies=[Depends(auth.require_roles(RoleEnum.librarian, RoleEnum.hod, RoleEnum.admin))])
 def get_account_status(roll_number: str, db: Session = Depends(get_db)):
     student = db.query(models.User).filter(
         models.User.roll_number == roll_number,
@@ -447,8 +469,9 @@ def get_account_status(roll_number: str, db: Session = Depends(get_db)):
     }
 
 
-@app.post("/api/admin/account-status")
-def set_account_status(req: schemas.AccountStatusUpdate, db: Session = Depends(get_db)):
+@api.post("/api/admin/account-status")
+def set_account_status(req: schemas.AccountStatusUpdate, db: Session = Depends(get_db), current: models.User = Depends(auth.require_roles(RoleEnum.admin))):
+    req.changed_by = current.id
     admin = db.query(models.User).filter(models.User.id == req.changed_by).first()
     if not admin or admin.role != RoleEnum.admin:
         raise HTTPException(status_code=403, detail="Only admin accounts can change account status")
@@ -478,7 +501,7 @@ def set_account_status(req: schemas.AccountStatusUpdate, db: Session = Depends(g
 # Admin — system alerts (things that need manual follow-up)
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.get("/api/admin/system-alerts", response_model=list[schemas.SystemAlertOut])
+@api.get("/api/admin/system-alerts", dependencies=[Depends(auth.require_roles(RoleEnum.admin))], response_model=list[schemas.SystemAlertOut])
 def get_system_alerts(unread_only: bool = False, db: Session = Depends(get_db)):
     q = db.query(models.SystemAlert)
     if unread_only:
@@ -486,7 +509,7 @@ def get_system_alerts(unread_only: bool = False, db: Session = Depends(get_db)):
     return q.order_by(models.SystemAlert.created_at.desc()).all()
 
 
-@app.post("/api/admin/system-alerts/{alert_id}/mark-read")
+@api.post("/api/admin/system-alerts/{alert_id}/mark-read", dependencies=[Depends(auth.require_roles(RoleEnum.admin))])
 def mark_system_alert_read(alert_id: int, db: Session = Depends(get_db)):
     alert = db.query(models.SystemAlert).filter(models.SystemAlert.id == alert_id).first()
     if not alert:
@@ -498,7 +521,7 @@ def mark_system_alert_read(alert_id: int, db: Session = Depends(get_db)):
 
 
 
-@app.get("/api/admin/settings")
+@api.get("/api/admin/settings")
 def get_settings(db: Session = Depends(get_db)):
     settings = db.query(models.SystemSetting).all()
     result = {s.key: s.value for s in settings}
@@ -507,8 +530,9 @@ def get_settings(db: Session = Depends(get_db)):
     return result
 
 
-@app.post("/api/admin/settings")
-def update_setting(key: str, value: str, updated_by: int, db: Session = Depends(get_db)):
+@api.post("/api/admin/settings")
+def update_setting(key: str, value: str, updated_by: int, db: Session = Depends(get_db), current: models.User = Depends(auth.require_roles(RoleEnum.admin))):
+    updated_by = current.id
     if key not in ["fine_per_day"]:
         raise HTTPException(status_code=400, detail=f"Unknown setting: {key}")
 
@@ -535,13 +559,14 @@ def update_setting(key: str, value: str, updated_by: int, db: Session = Depends(
 # Course limits (HOD)
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.get("/api/course-limits", response_model=list[schemas.CourseLimitOut])
+@api.get("/api/course-limits", response_model=list[schemas.CourseLimitOut])
 def get_course_limits(db: Session = Depends(get_db)):
     return db.query(models.CourseLimit).all()
 
 
-@app.post("/api/course-limits", response_model=schemas.CourseLimitOut)
-def set_course_limit(req: schemas.CourseLimitSet, db: Session = Depends(get_db)):
+@api.post("/api/course-limits", response_model=schemas.CourseLimitOut)
+def set_course_limit(req: schemas.CourseLimitSet, db: Session = Depends(get_db), current: models.User = Depends(auth.require_roles(RoleEnum.hod, RoleEnum.admin))):
+    req.set_by = current.id
     if req.course_prefix not in COURSE_MAP:
         raise HTTPException(status_code=400, detail=f"Unknown course prefix: {req.course_prefix}")
     if req.max_books < 1 or req.max_books > 20:
@@ -566,8 +591,9 @@ def set_course_limit(req: schemas.CourseLimitSet, db: Session = Depends(get_db))
 # Books
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.post("/api/books", response_model=schemas.BookOut)
-def add_book(req: schemas.BookCreate, db: Session = Depends(get_db)):
+@api.post("/api/books", response_model=schemas.BookOut)
+def add_book(req: schemas.BookCreate, db: Session = Depends(get_db), current: models.User = Depends(auth.require_roles(RoleEnum.librarian, RoleEnum.admin))):
+    req.added_by = current.id
     if req.media_type == MediaType.book:
         if not any([req.elig_students, req.elig_teaching_staff, req.elig_non_teaching_staff]):
             raise HTTPException(status_code=400, detail="At least one eligibility group must be selected")
@@ -606,13 +632,13 @@ def add_book(req: schemas.BookCreate, db: Session = Depends(get_db)):
     return book
 
 
-@app.get("/api/books", response_model=list[schemas.BookOut])
+@api.get("/api/books", response_model=list[schemas.BookOut])
 def get_books(db: Session = Depends(get_db)):
     expire_stale_reservations(db)
     return db.query(models.Book).filter(models.Book.is_active == True).all()
 
 
-@app.get("/api/books/search")
+@api.get("/api/books/search")
 def search_books(
     isbn: str = None, title: str = None, author: str = None,
     subject: str = None, media_type: str = None,
@@ -656,8 +682,11 @@ def search_books(
     return query.all()
 
 
-@app.get("/api/books/recommendations")
-def get_recommendations(roll_number: str = None, limit: int = 6, db: Session = Depends(get_db)):
+@api.get("/api/books/recommendations")
+def get_recommendations(roll_number: str = None, limit: int = 6, db: Session = Depends(get_db), current: models.User = Depends(auth.get_current_user)):
+    if current.role == RoleEnum.student:
+        # Students only ever see recommendations for their own course.
+        roll_number = current.roll_number
     query = db.query(models.Book).filter(
         models.Book.is_active == True,
         models.Book.elig_students == True,
@@ -690,7 +719,7 @@ def get_recommendations(roll_number: str = None, limit: int = 6, db: Session = D
     return books
 
 
-@app.get("/api/books/{book_id}", response_model=schemas.BookOut)
+@api.get("/api/books/{book_id}", response_model=schemas.BookOut)
 def get_book(book_id: int, db: Session = Depends(get_db)):
     book = db.query(models.Book).filter(models.Book.id == book_id).first()
     if not book:
@@ -698,8 +727,9 @@ def get_book(book_id: int, db: Session = Depends(get_db)):
     return book
 
 
-@app.delete("/api/books/{book_id}")
-def delete_book(book_id: int, changed_by: int, db: Session = Depends(get_db)):
+@api.delete("/api/books/{book_id}")
+def delete_book(book_id: int, changed_by: int, db: Session = Depends(get_db), current: models.User = Depends(auth.require_roles(RoleEnum.librarian, RoleEnum.admin))):
+    changed_by = current.id
     book = db.query(models.Book).filter(models.Book.id == book_id).first()
     if not book:
         raise HTTPException(status_code=404, detail="Book not found")
@@ -716,7 +746,7 @@ def delete_book(book_id: int, changed_by: int, db: Session = Depends(get_db)):
     return {"message": "Book deactivated successfully"}
 
 
-@app.get("/api/books/{book_id}/history", response_model=list[schemas.BookHistoryOut])
+@api.get("/api/books/{book_id}/history", response_model=list[schemas.BookHistoryOut])
 def get_book_history(book_id: int, db: Session = Depends(get_db)):
     return db.query(models.BookHistory).filter(
         models.BookHistory.book_id == book_id
@@ -727,8 +757,10 @@ def get_book_history(book_id: int, db: Session = Depends(get_db)):
 # Reviews
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.post("/api/books/{book_id}/reviews", response_model=schemas.ReviewOut)
-def add_review(book_id: int, req: schemas.ReviewCreate, db: Session = Depends(get_db)):
+@api.post("/api/books/{book_id}/reviews", response_model=schemas.ReviewOut)
+def add_review(book_id: int, req: schemas.ReviewCreate, db: Session = Depends(get_db), current: models.User = Depends(auth.get_current_user)):
+    if req.user_id != current.id:
+        raise HTTPException(status_code=403, detail="You can only review as yourself.")
     if req.rating < 1 or req.rating > 5:
         raise HTTPException(status_code=400, detail="Rating must be between 1 and 5")
 
@@ -772,15 +804,16 @@ def add_review(book_id: int, req: schemas.ReviewCreate, db: Session = Depends(ge
     return review
 
 
-@app.get("/api/books/{book_id}/reviews", response_model=list[schemas.ReviewOut])
+@api.get("/api/books/{book_id}/reviews", response_model=list[schemas.ReviewOut])
 def get_reviews(book_id: int, db: Session = Depends(get_db)):
     return db.query(models.BookReview).filter(
         models.BookReview.book_id == book_id
     ).order_by(models.BookReview.created_at.desc()).all()
 
 
-@app.get("/api/books/{book_id}/my-review")
-def get_my_review(book_id: int, user_id: int, db: Session = Depends(get_db)):
+@api.get("/api/books/{book_id}/my-review")
+def get_my_review(book_id: int, user_id: int, db: Session = Depends(get_db), current: models.User = Depends(auth.get_current_user)):
+    auth.ensure_self_or_staff(current, user_id)
     review = db.query(models.BookReview).filter(
         models.BookReview.book_id == book_id,
         models.BookReview.user_id == user_id
@@ -794,8 +827,9 @@ def get_my_review(book_id: int, user_id: int, db: Session = Depends(get_db)):
 # Student data
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.get("/api/student/issued/{user_id}")
-def get_student_issued(user_id: int, db: Session = Depends(get_db)):
+@api.get("/api/student/issued/{user_id}")
+def get_student_issued(user_id: int, db: Session = Depends(get_db), current: models.User = Depends(auth.get_current_user)):
+    auth.ensure_self_or_staff(current, user_id)
     expire_stale_reservations(db)
 
     user = db.query(models.User).filter(models.User.id == user_id).first()
@@ -913,8 +947,9 @@ def get_student_issued(user_id: int, db: Session = Depends(get_db)):
 # Student book status
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.get("/api/books/{book_id}/student-status")
-def get_book_student_status(book_id: int, user_id: int, db: Session = Depends(get_db)):
+@api.get("/api/books/{book_id}/student-status")
+def get_book_student_status(book_id: int, user_id: int, db: Session = Depends(get_db), current: models.User = Depends(auth.get_current_user)):
+    auth.ensure_self_or_staff(current, user_id)
     expire_stale_reservations(db)
     book = db.query(models.Book).filter(models.Book.id == book_id).first()
     if not book:
@@ -998,10 +1033,13 @@ def get_book_student_status(book_id: int, user_id: int, db: Session = Depends(ge
 # Reserve
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.post("/api/books/reserve")
-def reserve_book(req: schemas.ReserveRequest, db: Session = Depends(get_db)):
+@api.post("/api/books/reserve")
+def reserve_book(req: schemas.ReserveRequest, db: Session = Depends(get_db), current: models.User = Depends(auth.get_current_user)):
+    if not auth.is_staff(current) and req.roll_number != current.roll_number:
+        raise HTTPException(status_code=403, detail="You can only reserve books for your own account.")
+    req.user_id = current.id
     expire_stale_reservations(db)
-    book = db.query(models.Book).filter(models.Book.id == req.book_id).first()
+    book = db.query(models.Book).filter(models.Book.id == req.book_id).with_for_update().populate_existing().first()
     if not book:
         raise HTTPException(status_code=404, detail="Book not found")
     if book.book_type == BookType.reference:
@@ -1061,7 +1099,7 @@ def reserve_book(req: schemas.ReserveRequest, db: Session = Depends(get_db)):
     copy = db.query(models.BookCopy).filter(
         models.BookCopy.book_id == req.book_id,
         models.BookCopy.status == CopyStatus.available
-    ).first()
+    ).with_for_update().first()
     if not copy:
         raise HTTPException(status_code=400, detail="No available copies found")
 
@@ -1090,19 +1128,37 @@ def reserve_book(req: schemas.ReserveRequest, db: Session = Depends(get_db)):
 # Issue
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.post("/api/books/issue")
-def issue_book(req: schemas.IssueRequest, db: Session = Depends(get_db)):
-    copy = db.query(models.BookCopy).filter(models.BookCopy.copy_code == req.copy_code).first()
+@api.post("/api/books/issue")
+def issue_book(req: schemas.IssueRequest, db: Session = Depends(get_db), current: models.User = Depends(auth.require_roles(RoleEnum.librarian))):
+    req.librarian_id = current.id
+    copy = lock_book_and_copy(db, req.copy_code)
     if not copy:
         raise HTTPException(status_code=404, detail="Copy not found")
     if copy.status not in [CopyStatus.available, CopyStatus.reserved]:
         raise HTTPException(status_code=400, detail=f"Copy is {copy.status}, cannot issue")
 
     student = db.query(models.User).filter(models.User.roll_number == req.roll_number).first()
-    if student and student.is_blocked:
+    if not student or student.role != RoleEnum.student:
+        raise HTTPException(status_code=404, detail=f"No student account with roll number {req.roll_number}.")
+    if student.is_blocked:
         raise HTTPException(status_code=400, detail=f"{req.roll_number} is blocked due to pending fines or unresolved lost/damaged book. Cannot issue.")
-    if student and student.account_status != AccountStatus.active:
+    if student.account_status != AccountStatus.active:
         raise HTTPException(status_code=400, detail=f"{req.roll_number} is marked as {student.account_status.value} and cannot be issued books.")
+    if copy.status == CopyStatus.reserved and copy.reserved_by_roll != req.roll_number:
+        raise HTTPException(status_code=400, detail=f"Copy {copy.copy_code} is reserved for another student.")
+
+    held = db.query(models.BookCopy).filter(
+        models.BookCopy.issued_to_roll == req.roll_number,
+        models.BookCopy.status == CopyStatus.issued,
+    ).count()
+    reserved_elsewhere = db.query(models.BookCopy).filter(
+        models.BookCopy.reserved_by_roll == req.roll_number,
+        models.BookCopy.status == CopyStatus.reserved,
+        models.BookCopy.id != copy.id,
+    ).count()
+    book_limit = get_student_book_limit(req.roll_number, db)
+    if held + reserved_elsewhere >= book_limit:
+        raise HTTPException(status_code=400, detail=f"{req.roll_number} has reached the book limit ({book_limit}).")
 
     was_reserved = copy.status == CopyStatus.reserved
     now = datetime.utcnow()
@@ -1133,9 +1189,14 @@ def issue_book(req: schemas.IssueRequest, db: Session = Depends(get_db)):
 # Renew
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.post("/api/books/renew")
-def renew_book(req: schemas.RenewRequest, db: Session = Depends(get_db)):
-    copy = db.query(models.BookCopy).filter(models.BookCopy.copy_code == req.copy_code).first()
+@api.post("/api/books/renew")
+def renew_book(req: schemas.RenewRequest, db: Session = Depends(get_db), current: models.User = Depends(auth.get_current_user)):
+    if current.role == RoleEnum.student:
+        if req.user_id != current.id:
+            raise HTTPException(status_code=403, detail="You can only renew your own books.")
+    elif current.role != RoleEnum.librarian:
+        raise HTTPException(status_code=403, detail="You do not have permission for this action.")
+    copy = lock_book_and_copy(db, req.copy_code)
     if not copy:
         raise HTTPException(status_code=404, detail="Copy not found")
     if copy.status != CopyStatus.issued:
@@ -1213,9 +1274,10 @@ def renew_book(req: schemas.RenewRequest, db: Session = Depends(get_db)):
 # Return
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.post("/api/books/return")
-def return_book(req: schemas.ReturnRequest, db: Session = Depends(get_db)):
-    copy = db.query(models.BookCopy).filter(models.BookCopy.copy_code == req.copy_code).first()
+@api.post("/api/books/return")
+def return_book(req: schemas.ReturnRequest, db: Session = Depends(get_db), current: models.User = Depends(auth.require_roles(RoleEnum.librarian))):
+    req.librarian_id = current.id
+    copy = lock_book_and_copy(db, req.copy_code)
     if not copy:
         raise HTTPException(status_code=404, detail="Copy not found")
     if copy.status != CopyStatus.issued:
@@ -1320,14 +1382,16 @@ def return_book(req: schemas.ReturnRequest, db: Session = Depends(get_db)):
     return {"message": f"Book returned by {roll_number}", "condition": req.condition, "fine": overdue_fine, "needs_resolution": False}
 
 
-@app.post("/api/books/resolve-damage-loss")
+@api.post("/api/books/resolve-damage-loss")
 def resolve_damage_loss(
     copy_code: str,
     roll_number: str,
     resolution: str,   # "replace" or "pay"
     librarian_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current: models.User = Depends(auth.require_roles(RoleEnum.librarian)),
 ):
+    librarian_id = current.id
     copy = db.query(models.BookCopy).filter(models.BookCopy.copy_code == copy_code).first()
     if not copy:
         raise HTTPException(status_code=404, detail="Copy not found")
@@ -1386,7 +1450,7 @@ def resolve_damage_loss(
 # Librarian views
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.get("/api/librarian/reservations")
+@api.get("/api/librarian/reservations", dependencies=[Depends(auth.require_roles(RoleEnum.librarian, RoleEnum.hod, RoleEnum.admin))])
 def get_reservations(db: Session = Depends(get_db)):
     expire_stale_reservations(db)
     copies = db.query(models.BookCopy).filter(models.BookCopy.status == CopyStatus.reserved).all()
@@ -1405,7 +1469,7 @@ def get_reservations(db: Session = Depends(get_db)):
     ]
 
 
-@app.get("/api/librarian/issued")
+@api.get("/api/librarian/issued", dependencies=[Depends(auth.require_roles(RoleEnum.librarian, RoleEnum.hod, RoleEnum.admin))])
 def get_issued(db: Session = Depends(get_db)):
     copies = db.query(models.BookCopy).filter(models.BookCopy.status == CopyStatus.issued).all()
     now = datetime.utcnow()
@@ -1429,8 +1493,9 @@ def get_issued(db: Session = Depends(get_db)):
 # Fines
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.get("/api/fines/student/{roll_number}")
-def get_student_fines(roll_number: str, db: Session = Depends(get_db)):
+@api.get("/api/fines/student/{roll_number}")
+def get_student_fines(roll_number: str, db: Session = Depends(get_db), current: models.User = Depends(auth.get_current_user)):
+    auth.ensure_roll_self_or_staff(current, roll_number)
     now = datetime.utcnow()
 
     fine_records = db.query(models.FineRecord).filter(
@@ -1481,8 +1546,9 @@ def get_student_fines(roll_number: str, db: Session = Depends(get_db)):
     return result
 
 
-@app.post("/api/fines/collect")
-def collect_fine(req: schemas.FinePayment, db: Session = Depends(get_db)):
+@api.post("/api/fines/collect")
+def collect_fine(req: schemas.FinePayment, db: Session = Depends(get_db), current: models.User = Depends(auth.require_roles(RoleEnum.librarian))):
+    req.recorded_by = current.id
     fine = db.query(models.FineRecord).filter(models.FineRecord.id == req.fine_id).first()
     if not fine:
         raise HTTPException(status_code=404, detail="Fine record not found")
@@ -1527,7 +1593,7 @@ def collect_fine(req: schemas.FinePayment, db: Session = Depends(get_db)):
     }
 
 
-@app.get("/api/fines/pending")
+@api.get("/api/fines/pending", dependencies=[Depends(auth.require_roles(RoleEnum.librarian, RoleEnum.hod, RoleEnum.admin))])
 def get_all_pending_fines(db: Session = Depends(get_db)):
     fines = db.query(models.FineRecord).filter(
         models.FineRecord.is_cleared == False
@@ -1547,7 +1613,7 @@ def get_all_pending_fines(db: Session = Depends(get_db)):
         for f in fines
     ]
 
-@app.get("/api/noc/check/{roll_number}")
+@api.get("/api/noc/check/{roll_number}", dependencies=[Depends(auth.require_roles(RoleEnum.librarian, RoleEnum.hod, RoleEnum.admin))])
 def check_noc_eligibility(roll_number: str, db: Session = Depends(get_db)):
     student = db.query(models.User).filter(
         models.User.roll_number == roll_number,
@@ -1599,8 +1665,9 @@ def check_noc_eligibility(roll_number: str, db: Session = Depends(get_db)):
     }
 
 
-@app.get("/api/noc/generate/{roll_number}")
-def generate_noc(roll_number: str, librarian_id: int, db: Session = Depends(get_db)):
+@api.get("/api/noc/generate/{roll_number}")
+def generate_noc(roll_number: str, librarian_id: int, db: Session = Depends(get_db), current: models.User = Depends(auth.require_roles(RoleEnum.librarian))):
+    librarian_id = current.id
     from reportlab.lib.pagesizes import A4
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -1737,13 +1804,13 @@ def generate_noc(roll_number: str, librarian_id: int, db: Session = Depends(get_
 # Maintenance
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.post("/api/maintenance/expire-reservations")
+@api.post("/api/maintenance/expire-reservations")
 def force_expire_reservations(db: Session = Depends(get_db)):
     expire_stale_reservations(db)
     return {"message": "Reservation expiry check complete"}
 
 
-@app.get("/api/debug/reservations")
+@api.get("/api/debug/reservations", dependencies=[Depends(auth.require_roles(RoleEnum.admin))])
 def debug_reservations(db: Session = Depends(get_db)):
     now = datetime.utcnow()
     copies = db.query(models.BookCopy).filter(models.BookCopy.status == CopyStatus.reserved).all()
@@ -1763,8 +1830,10 @@ def debug_reservations(db: Session = Depends(get_db)):
 # Notifications
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.post("/api/notifications/request")
-def request_notification(req: schemas.NotificationRequest, db: Session = Depends(get_db)):
+@api.post("/api/notifications/request")
+def request_notification(req: schemas.NotificationRequest, db: Session = Depends(get_db), current: models.User = Depends(auth.get_current_user)):
+    if req.user_id != current.id:
+        raise HTTPException(status_code=403, detail="You can only join queues for your own account.")
     book = db.query(models.Book).filter(models.Book.id == req.book_id).first()
     if not book:
         raise HTTPException(status_code=404, detail="Book not found")
@@ -1794,8 +1863,9 @@ def request_notification(req: schemas.NotificationRequest, db: Session = Depends
     return {"message": f"Added to queue at position #{notification.queue_position}.", "queue_position": notification.queue_position}
 
 
-@app.get("/api/notifications/user/{user_id}", response_model=list[schemas.NotificationOut])
-def get_user_notifications(user_id: int, db: Session = Depends(get_db)):
+@api.get("/api/notifications/user/{user_id}", response_model=list[schemas.NotificationOut])
+def get_user_notifications(user_id: int, db: Session = Depends(get_db), current: models.User = Depends(auth.get_current_user)):
+    auth.ensure_self_or_staff(current, user_id)
     user_notifs = db.query(models.BookNotification).filter(
         models.BookNotification.user_id == user_id,
         models.BookNotification.status == NotificationStatus.notified
@@ -1819,11 +1889,12 @@ def get_user_notifications(user_id: int, db: Session = Depends(get_db)):
     ).order_by(models.BookNotification.requested_at.desc()).all()
 
 
-@app.delete("/api/notifications/{notification_id}")
-def cancel_notification(notification_id: int, db: Session = Depends(get_db)):
+@api.delete("/api/notifications/{notification_id}")
+def cancel_notification(notification_id: int, db: Session = Depends(get_db), current: models.User = Depends(auth.get_current_user)):
     n = db.query(models.BookNotification).filter(models.BookNotification.id == notification_id).first()
     if not n:
         raise HTTPException(status_code=404, detail="Not found")
+    auth.ensure_self_or_staff(current, n.user_id)
     db.delete(n)
     db.commit()
     return {"message": "Removed from queue"}
@@ -1833,8 +1904,9 @@ def cancel_notification(notification_id: int, db: Session = Depends(get_db)):
 # Override requests
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.post("/api/overrides", response_model=schemas.OverrideRequestOut)
-def create_override(req: schemas.OverrideRequestCreate, db: Session = Depends(get_db)):
+@api.post("/api/overrides", response_model=schemas.OverrideRequestOut)
+def create_override(req: schemas.OverrideRequestCreate, db: Session = Depends(get_db), current: models.User = Depends(auth.require_roles(RoleEnum.librarian))):
+    req.requested_by = current.id
     override = models.OverrideRequest(
         requested_by=req.requested_by, reason=req.reason,
         affected_record=req.affected_record, status=OverrideStatus.pending,
@@ -1845,22 +1917,25 @@ def create_override(req: schemas.OverrideRequestCreate, db: Session = Depends(ge
     return override
 
 
-@app.get("/api/overrides/pending", response_model=list[schemas.OverrideRequestOut])
+@api.get("/api/overrides/pending", dependencies=[Depends(auth.require_roles(RoleEnum.hod, RoleEnum.admin))], response_model=list[schemas.OverrideRequestOut])
 def get_pending_overrides(db: Session = Depends(get_db)):
     return db.query(models.OverrideRequest).filter(
         models.OverrideRequest.status == OverrideStatus.pending
     ).order_by(models.OverrideRequest.created_at).all()
 
 
-@app.get("/api/overrides/librarian/{librarian_id}", response_model=list[schemas.OverrideRequestOut])
-def get_librarian_overrides(librarian_id: int, db: Session = Depends(get_db)):
+@api.get("/api/overrides/librarian/{librarian_id}", response_model=list[schemas.OverrideRequestOut])
+def get_librarian_overrides(librarian_id: int, db: Session = Depends(get_db), current: models.User = Depends(auth.get_current_user)):
+    if current.id != librarian_id and current.role.value not in ("hod", "admin"):
+        raise HTTPException(status_code=403, detail="You can only view your own overrides.")
     return db.query(models.OverrideRequest).filter(
         models.OverrideRequest.requested_by == librarian_id
     ).order_by(models.OverrideRequest.created_at.desc()).all()
 
 
-@app.post("/api/overrides/review")
-def review_override(action: schemas.OverrideAction, db: Session = Depends(get_db)):
+@api.post("/api/overrides/review")
+def review_override(action: schemas.OverrideAction, db: Session = Depends(get_db), current: models.User = Depends(auth.require_roles(RoleEnum.hod))):
+    action.reviewed_by = current.id
     override = db.query(models.OverrideRequest).filter(models.OverrideRequest.id == action.override_id).first()
     if not override:
         raise HTTPException(status_code=404, detail="Override request not found")
@@ -1883,7 +1958,7 @@ def review_override(action: schemas.OverrideAction, db: Session = Depends(get_db
 # Analytics
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.get("/api/analytics/summary")
+@api.get("/api/analytics/summary", dependencies=[Depends(auth.require_roles(RoleEnum.librarian, RoleEnum.hod, RoleEnum.admin))])
 def get_analytics(db: Session = Depends(get_db)):
     total_books = db.query(models.Book).filter(models.Book.is_active == True).count()
     total_copies = db.query(func.sum(models.Book.total_copies)).filter(models.Book.is_active == True).scalar() or 0
@@ -1917,8 +1992,9 @@ def get_analytics(db: Session = Depends(get_db)):
 # Reading History
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.get("/api/student/history/{user_id}")
-def get_reading_history(user_id: int, db: Session = Depends(get_db)):
+@api.get("/api/student/history/{user_id}")
+def get_reading_history(user_id: int, db: Session = Depends(get_db), current: models.User = Depends(auth.get_current_user)):
+    auth.ensure_self_or_staff(current, user_id)
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -1978,8 +2054,9 @@ def get_reading_history(user_id: int, db: Session = Depends(get_db)):
 # Wishlist
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.get("/api/wishlist/{user_id}")
-def get_wishlist(user_id: int, db: Session = Depends(get_db)):
+@api.get("/api/wishlist/{user_id}")
+def get_wishlist(user_id: int, db: Session = Depends(get_db), current: models.User = Depends(auth.get_current_user)):
+    auth.ensure_self_or_staff(current, user_id)
     items = db.query(models.Wishlist).filter(
         models.Wishlist.user_id == user_id
     ).order_by(models.Wishlist.added_at.desc()).all()
@@ -1998,8 +2075,10 @@ def get_wishlist(user_id: int, db: Session = Depends(get_db)):
     ]
 
 
-@app.post("/api/wishlist")
-def add_to_wishlist(user_id: int, book_id: int, db: Session = Depends(get_db)):
+@api.post("/api/wishlist")
+def add_to_wishlist(user_id: int, book_id: int, db: Session = Depends(get_db), current: models.User = Depends(auth.get_current_user)):
+    if user_id != current.id:
+        raise HTTPException(status_code=403, detail="You can only edit your own wishlist.")
     existing = db.query(models.Wishlist).filter(
         models.Wishlist.user_id == user_id,
         models.Wishlist.book_id == book_id
@@ -2018,18 +2097,20 @@ def add_to_wishlist(user_id: int, book_id: int, db: Session = Depends(get_db)):
     return {"message": f"'{book.title}' added to your wishlist", "id": item.id}
 
 
-@app.delete("/api/wishlist/{wishlist_id}")
-def remove_from_wishlist(wishlist_id: int, db: Session = Depends(get_db)):
+@api.delete("/api/wishlist/{wishlist_id}")
+def remove_from_wishlist(wishlist_id: int, db: Session = Depends(get_db), current: models.User = Depends(auth.get_current_user)):
     item = db.query(models.Wishlist).filter(models.Wishlist.id == wishlist_id).first()
     if not item:
         raise HTTPException(status_code=404, detail="Wishlist item not found")
+    auth.ensure_self_or_staff(current, item.user_id)
     db.delete(item)
     db.commit()
     return {"message": "Removed from wishlist"}
 
 
-@app.get("/api/wishlist/{user_id}/check/{book_id}")
-def check_wishlist(user_id: int, book_id: int, db: Session = Depends(get_db)):
+@api.get("/api/wishlist/{user_id}/check/{book_id}")
+def check_wishlist(user_id: int, book_id: int, db: Session = Depends(get_db), current: models.User = Depends(auth.get_current_user)):
+    auth.ensure_self_or_staff(current, user_id)
     item = db.query(models.Wishlist).filter(
         models.Wishlist.user_id == user_id,
         models.Wishlist.book_id == book_id
@@ -2041,8 +2122,9 @@ def check_wishlist(user_id: int, book_id: int, db: Session = Depends(get_db)):
 # Book Requests (student new book + librarian more copies)
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.post("/api/book-requests", response_model=schemas.BookRequestOut)
-def create_book_request(req: schemas.BookRequestCreate, db: Session = Depends(get_db)):
+@api.post("/api/book-requests", response_model=schemas.BookRequestOut)
+def create_book_request(req: schemas.BookRequestCreate, db: Session = Depends(get_db), current: models.User = Depends(auth.get_current_user)):
+    req.requested_by = current.id
     request = models.BookRequest(
         requested_by=req.requested_by,
         title=req.title,
@@ -2059,7 +2141,7 @@ def create_book_request(req: schemas.BookRequestCreate, db: Session = Depends(ge
     return request
 
 
-@app.get("/api/book-requests", response_model=list[schemas.BookRequestOut])
+@api.get("/api/book-requests", dependencies=[Depends(auth.require_roles(RoleEnum.librarian, RoleEnum.hod, RoleEnum.admin))], response_model=list[schemas.BookRequestOut])
 def get_book_requests(
     status: str = None,
     request_type: str = None,
@@ -2073,15 +2155,17 @@ def get_book_requests(
     return q.order_by(models.BookRequest.created_at.desc()).all()
 
 
-@app.get("/api/book-requests/user/{user_id}", response_model=list[schemas.BookRequestOut])
-def get_user_book_requests(user_id: int, db: Session = Depends(get_db)):
+@api.get("/api/book-requests/user/{user_id}", response_model=list[schemas.BookRequestOut])
+def get_user_book_requests(user_id: int, db: Session = Depends(get_db), current: models.User = Depends(auth.get_current_user)):
+    auth.ensure_self_or_staff(current, user_id)
     return db.query(models.BookRequest).filter(
         models.BookRequest.requested_by == user_id
     ).order_by(models.BookRequest.created_at.desc()).all()
 
 
-@app.post("/api/book-requests/review")
-def review_book_request(req: schemas.BookRequestReview, db: Session = Depends(get_db)):
+@api.post("/api/book-requests/review")
+def review_book_request(req: schemas.BookRequestReview, db: Session = Depends(get_db), current: models.User = Depends(auth.require_roles(RoleEnum.hod))):
+    req.reviewed_by = current.id
     request = db.query(models.BookRequest).filter(models.BookRequest.id == req.request_id).first()
     if not request:
         raise HTTPException(status_code=404, detail="Request not found")
@@ -2102,8 +2186,9 @@ def review_book_request(req: schemas.BookRequestReview, db: Session = Depends(ge
 # Announcements
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.post("/api/announcements", response_model=schemas.AnnouncementOut)
-def create_announcement(req: schemas.AnnouncementCreate, db: Session = Depends(get_db)):
+@api.post("/api/announcements", response_model=schemas.AnnouncementOut)
+def create_announcement(req: schemas.AnnouncementCreate, db: Session = Depends(get_db), current: models.User = Depends(auth.require_roles(RoleEnum.admin))):
+    req.created_by = current.id
     ann = models.Announcement(
         title=req.title,
         body=req.body,
@@ -2117,7 +2202,7 @@ def create_announcement(req: schemas.AnnouncementCreate, db: Session = Depends(g
     return ann
 
 
-@app.get("/api/announcements", response_model=list[schemas.AnnouncementOut])
+@api.get("/api/announcements", response_model=list[schemas.AnnouncementOut])
 def get_announcements(db: Session = Depends(get_db)):
     now = datetime.utcnow()
     return db.query(models.Announcement).filter(
@@ -2129,7 +2214,7 @@ def get_announcements(db: Session = Depends(get_db)):
     ).order_by(models.Announcement.created_at.desc()).all()
 
 
-@app.delete("/api/announcements/{ann_id}")
+@api.delete("/api/announcements/{ann_id}", dependencies=[Depends(auth.require_roles(RoleEnum.admin))])
 def deactivate_announcement(ann_id: int, db: Session = Depends(get_db)):
     ann = db.query(models.Announcement).filter(models.Announcement.id == ann_id).first()
     if not ann:
@@ -2139,8 +2224,9 @@ def deactivate_announcement(ann_id: int, db: Session = Depends(get_db)):
     return {"message": "Announcement removed"}
 
 
-@app.post("/api/broadcasts", response_model=schemas.BroadcastOut)
-def create_broadcast(req: schemas.BroadcastCreate, db: Session = Depends(get_db)):
+@api.post("/api/broadcasts", response_model=schemas.BroadcastOut)
+def create_broadcast(req: schemas.BroadcastCreate, db: Session = Depends(get_db), current: models.User = Depends(auth.require_roles(RoleEnum.admin))):
+    req.created_by = current.id
     if not req.title.strip() or not req.body.strip():
         raise HTTPException(status_code=400, detail="Title and body are required")
     if not req.target_roles:
@@ -2160,8 +2246,10 @@ def create_broadcast(req: schemas.BroadcastCreate, db: Session = Depends(get_db)
     return broadcast
 
 
-@app.get("/api/broadcasts", response_model=list[schemas.BroadcastOut])
-def get_active_broadcasts(role: str = None, db: Session = Depends(get_db)):
+@api.get("/api/broadcasts", response_model=list[schemas.BroadcastOut])
+def get_active_broadcasts(role: str = None, db: Session = Depends(get_db), current: models.User = Depends(auth.get_current_user)):
+    # Always filter by the caller's own role; ignore any client-supplied value.
+    role = current.role.value
     now = datetime.utcnow()
     query = db.query(models.BroadcastMessage).filter(
         models.BroadcastMessage.is_active == True,
@@ -2179,14 +2267,14 @@ def get_active_broadcasts(role: str = None, db: Session = Depends(get_db)):
     return query.order_by(models.BroadcastMessage.created_at.desc()).all()
 
 
-@app.get("/api/broadcasts/all", response_model=list[schemas.BroadcastOut])
+@api.get("/api/broadcasts/all", dependencies=[Depends(auth.require_roles(RoleEnum.admin))], response_model=list[schemas.BroadcastOut])
 def get_all_broadcasts(db: Session = Depends(get_db)):
     return db.query(models.BroadcastMessage).order_by(
         models.BroadcastMessage.created_at.desc()
     ).all()
 
 
-@app.delete("/api/broadcasts/{broadcast_id}")
+@api.delete("/api/broadcasts/{broadcast_id}", dependencies=[Depends(auth.require_roles(RoleEnum.admin))])
 def deactivate_broadcast(broadcast_id: int, db: Session = Depends(get_db)):
     broadcast = db.query(models.BroadcastMessage).filter(
         models.BroadcastMessage.id == broadcast_id
@@ -2198,8 +2286,9 @@ def deactivate_broadcast(broadcast_id: int, db: Session = Depends(get_db)):
     return {"message": "Broadcast removed"}
 
 
-@app.post("/api/carousels", response_model=schemas.CarouselOut)
-def create_carousel(req: schemas.CarouselCreate, db: Session = Depends(get_db)):
+@api.post("/api/carousels", response_model=schemas.CarouselOut)
+def create_carousel(req: schemas.CarouselCreate, db: Session = Depends(get_db), current: models.User = Depends(auth.require_roles(RoleEnum.admin))):
+    req.created_by = current.id
     if not req.message.strip():
         raise HTTPException(status_code=400, detail="Message is required")
     if len(req.message.strip()) > 200:
@@ -2217,7 +2306,7 @@ def create_carousel(req: schemas.CarouselCreate, db: Session = Depends(get_db)):
     return carousel
 
 
-@app.get("/api/carousels", response_model=list[schemas.CarouselOut])
+@api.get("/api/carousels", response_model=list[schemas.CarouselOut])
 def get_active_carousels(db: Session = Depends(get_db)):
     now = datetime.utcnow()
     return db.query(models.CarouselMessage).filter(
@@ -2226,14 +2315,14 @@ def get_active_carousels(db: Session = Depends(get_db)):
     ).order_by(models.CarouselMessage.created_at.desc()).all()
 
 
-@app.get("/api/carousels/all", response_model=list[schemas.CarouselOut])
+@api.get("/api/carousels/all", dependencies=[Depends(auth.require_roles(RoleEnum.admin))], response_model=list[schemas.CarouselOut])
 def get_all_carousels(db: Session = Depends(get_db)):
     return db.query(models.CarouselMessage).order_by(
         models.CarouselMessage.created_at.desc()
     ).all()
 
 
-@app.delete("/api/carousels/{carousel_id}")
+@api.delete("/api/carousels/{carousel_id}", dependencies=[Depends(auth.require_roles(RoleEnum.admin))])
 def deactivate_carousel(carousel_id: int, db: Session = Depends(get_db)):
     carousel = db.query(models.CarouselMessage).filter(
         models.CarouselMessage.id == carousel_id
@@ -2249,7 +2338,7 @@ def deactivate_carousel(carousel_id: int, db: Session = Depends(get_db)):
 # Department analytics
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.get("/api/analytics/department")
+@api.get("/api/analytics/department", dependencies=[Depends(auth.require_roles(RoleEnum.librarian, RoleEnum.hod, RoleEnum.admin))])
 def get_department_analytics(db: Session = Depends(get_db)):
     COURSE_MAP_LOCAL = {
         "CS": "Computer Science", "AI": "AI/ML", "EC": "ECE",
@@ -2321,7 +2410,7 @@ def get_department_analytics(db: Session = Depends(get_db)):
 # HOD Reports
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.get("/api/reports/hod")
+@api.get("/api/reports/hod", dependencies=[Depends(auth.require_roles(RoleEnum.librarian, RoleEnum.hod, RoleEnum.admin))])
 def hod_report(
     type: str = "issued",
     date_from: str = None,
@@ -2523,7 +2612,7 @@ def hod_report(
     return {"rows": rows, "total_rows": len(rows), "summary": summary}
 
 
-@app.get("/api/reports/hod/export")
+@api.get("/api/reports/hod/export", dependencies=[Depends(auth.require_roles(RoleEnum.librarian, RoleEnum.hod, RoleEnum.admin))])
 def hod_report_export(
     type: str = "issued",
     date_from: str = None,
@@ -2582,3 +2671,7 @@ def hod_report_export(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
+
+
+# Mount the protected routes (must come after every @api decorator above).
+app.include_router(api)

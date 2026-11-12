@@ -4,9 +4,13 @@ import config from "../../config";
 
 const MAX_HISTORY_TURNS = 3;
 
+// A librarian typing just a roll number (optionally after "student", "open" or
+// "roll number") opens that student's menu. Anything else is an ordinary question.
+const ROLL_INPUT = /^(?:(?:open|show|student|roll(?:\s*(?:no\.?|number))?)\s+)*([A-Za-z0-9]{5,20})$/i;
+
 const EMPTY_HINTS = {
   student: `Ask things like "what have I borrowed", "when is my book due", or "is Operating System Concepts available".`,
-  librarian: `Ask things like "how many books are overdue right now", or give an instruction like "issue Operating System Concepts to PES1UG24CS001", "return copy BK-...-01" or "renew PES1UG24CS001's book". You'll get a confirmation card before anything changes.`,
+  librarian: `Type a student's roll number (e.g. PES1UG24CS001) to see what you can do for them. Or ask things like "how many books are overdue right now", or give an instruction like "issue Operating System Concepts to PES1UG24CS001". You'll get a confirmation card before anything changes.`,
   hod: `Ask things like "how many books are overdue right now" or "what has PES1UG24CS001 borrowed".`,
 };
 
@@ -34,11 +38,15 @@ function failureReason(res, data) {
 export default function ChatbotWidget({ user, darkMode }) {
   const [open, setOpen] = useState(false);
   const [input, setInput] = useState("");
-  // Each message: { question, answer, historyAnswer?, sql?, error?, pending? }
-  // pending (librarian actions only): { action, copy_code, roll_number, summary,
+  // Each message: { question, answer, historyAnswer?, sql?, error?, pending?,
+  //   operations?, roll_number?, choices?, choiceContext?, choicesUsed?, download?, flow? }
+  // pending (librarian actions only): { action, copy_code, roll_number, summary, fine_id?, resolution?,
   //   status: "pending" | "running" | "done" | "failed" | "cancelled", resultMessage? }
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(false);
+  // While a guided operation is waiting for a typed answer (e.g. a book title):
+  // { roll_number, operation }. Whatever the librarian types next is the answer.
+  const [flow, setFlow] = useState(null);
   const scrollRef = useRef(null);
 
   useEffect(() => {
@@ -51,12 +59,19 @@ export default function ChatbotWidget({ user, darkMode }) {
     setMessages(prev => prev.map((m, i) => (i === index ? { ...m, ...patch } : m)));
   };
 
-  const send = async () => {
-    const question = input.trim();
-    if (!question || loading) return;
-    setInput("");
+  // Runs one request-driven step with the shared "Thinking…" state.
+  const withLoading = async (task) => {
+    if (loading) return;
     setLoading(true);
+    try {
+      await task();
+    } finally {
+      setLoading(false);
+    }
+  };
 
+  // Plain question to the model (the original behaviour).
+  const askQuestion = async (question) => {
     // historyAnswer lets an action turn tell the model what actually happened
     // (e.g. "cancelled", or the confirmed result) rather than just the preview.
     const history = messages
@@ -85,9 +100,132 @@ export default function ChatbotWidget({ user, darkMode }) {
       setMessages(prev => [...prev, message]);
     } catch (err) {
       setMessages(prev => [...prev, { question, answer: err.message, error: true }]);
-    } finally {
-      setLoading(false);
     }
+  };
+
+  // Librarian typed a roll number: fetch that student's menu. Resolves to false
+  // when the number isn't a student, so the caller can treat the text as a question.
+  const openStudentMenu = async (question, rollNumber) => {
+    const { res, data, reason } = await describeFailure(
+      fetch(`${config.API_URL}/api/chatbot/student-menu`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ roll_number: rollNumber, user_id: user.id }),
+      })
+    );
+
+    try {
+      if (reason) throw new Error(reason);
+      if (!res.ok) throw new Error(failureReason(res, data));
+      if (!data.is_student) return false;
+      setFlow(null);
+      setMessages(prev => [...prev, {
+        question,
+        answer: data.message,
+        operations: data.operations,
+        roll_number: data.roll_number,
+      }]);
+    } catch (err) {
+      setMessages(prev => [...prev, { question, answer: err.message, error: true }]);
+    }
+    return true;
+  };
+
+  // One step of a guided operation. `label` is what appears as the librarian's bubble.
+  const runFlowStep = async (step, label) => {
+    const { res, data, reason } = await describeFailure(
+      fetch(`${config.API_URL}/api/chatbot/student-flow`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          user_id: user.id,
+          roll_number: step.roll_number,
+          operation: step.operation,
+          selection: step.selection ?? null,
+        }),
+      })
+    );
+
+    try {
+      if (reason) throw new Error(reason);
+      if (!res.ok) throw new Error(failureReason(res, data));
+
+      const next = { roll_number: step.roll_number, operation: step.operation };
+      setMessages(prev => [...prev, {
+        question: label,
+        answer: data.message,
+        flow: true,
+        choices: data.choices,
+        choiceContext: next,
+        download: data.download,
+        pending: data.pending_action ? { ...data.pending_action, status: "pending" } : undefined,
+        historyAnswer: data.pending_action
+          ? `${data.message} (Not done yet — waiting for the librarian to confirm.)`
+          : undefined,
+      }]);
+      setFlow(data.awaiting_text ? next : null);
+    } catch (err) {
+      setMessages(prev => [...prev, { question: label, answer: err.message, error: true }]);
+      setFlow(null);
+    }
+  };
+
+  const send = () => {
+    const question = input.trim();
+    if (!question || loading) return;
+    setInput("");
+    withLoading(async () => {
+      if (flow) {
+        await runFlowStep({ ...flow, selection: question }, question);
+        return;
+      }
+      if (user.role === "librarian") {
+        const match = question.match(ROLL_INPUT);
+        if (match && await openStudentMenu(question, match[1])) return;
+      }
+      await askQuestion(question);
+    });
+  };
+
+  // Clicking an operation in a student's menu.
+  const chooseOperation = (index, rollNumber, operation) => {
+    if (loading) return;
+    updateMessage(index, { choicesUsed: true });
+    withLoading(() => runFlowStep({ roll_number: rollNumber, operation: operation.key }, operation.label));
+  };
+
+  // Clicking one of the options a flow step offered (a book, a fine, a decision).
+  const chooseOption = (index, context, choice) => {
+    if (loading) return;
+    updateMessage(index, { choicesUsed: true });
+    withLoading(() => runFlowStep({ ...context, selection: choice.value }, choice.label));
+  };
+
+  const stopFlow = () => {
+    setFlow(null);
+  };
+
+  const downloadNoc = (rollNumber) => {
+    withLoading(async () => {
+      const { res, data, reason } = await describeFailure(
+        fetch(`${config.API_URL}/api/noc/generate/${encodeURIComponent(rollNumber)}?librarian_id=${user.id}`)
+      );
+      try {
+        if (reason) throw new Error(reason);
+        if (!res.ok) throw new Error(failureReason(res, data));
+        const blob = await res.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `NOC_${rollNumber}.pdf`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        window.URL.revokeObjectURL(url);
+      } catch (err) {
+        setMessages(prev => [...prev, { question: "Download NOC", answer: err.message, error: true }]);
+      }
+    });
   };
 
   const confirmAction = async (index) => {
@@ -104,6 +242,8 @@ export default function ChatbotWidget({ user, darkMode }) {
           action: pending.action,
           copy_code: pending.copy_code,
           roll_number: pending.roll_number,
+          fine_id: pending.fine_id ?? null,
+          resolution: pending.resolution ?? null,
           user_id: user.id,
         }),
       })
@@ -158,6 +298,46 @@ export default function ChatbotWidget({ user, darkMode }) {
     );
   };
 
+  const renderOptions = (m, i) => (
+    <>
+      {m.operations && !m.choicesUsed && (
+        <div className="chatbot-options">
+          {m.operations.map(op => (
+            <button
+              key={op.key}
+              className="chatbot-option"
+              disabled={loading}
+              onClick={() => chooseOperation(i, m.roll_number, op)}
+            >
+              {op.label}
+            </button>
+          ))}
+        </div>
+      )}
+      {m.choices && m.choices.length > 0 && !m.choicesUsed && (
+        <div className="chatbot-options">
+          {m.choices.map(choice => (
+            <button
+              key={choice.value}
+              className="chatbot-option"
+              disabled={loading}
+              onClick={() => chooseOption(i, m.choiceContext, choice)}
+            >
+              {choice.label}
+            </button>
+          ))}
+        </div>
+      )}
+      {m.download && (
+        <div className="chatbot-options">
+          <button className="chatbot-option" disabled={loading} onClick={() => downloadNoc(m.download.roll_number)}>
+            Download NOC (PDF)
+          </button>
+        </div>
+      )}
+    </>
+  );
+
   // Rendered via a portal straight into document.body so this always
   // floats above the page regardless of any dashboard ancestor's own
   // CSS (fixed sidebars/topbars can otherwise trap position:fixed
@@ -190,6 +370,7 @@ export default function ChatbotWidget({ user, darkMode }) {
                 <div className="chatbot-bubble chatbot-bubble-user">{m.question}</div>
                 <div className={`chatbot-bubble chatbot-bubble-bot ${m.error ? "chatbot-bubble-error" : ""}`}>
                   {m.answer}
+                  {(m.operations || m.choices || m.download) && renderOptions(m, i)}
                   {m.pending && renderActionCard(m, i)}
                   {m.sql && (
                     <details className="chatbot-sql-toggle">
@@ -207,10 +388,17 @@ export default function ChatbotWidget({ user, darkMode }) {
             )}
           </div>
 
+          {flow && (
+            <div className="chatbot-flow-banner">
+              <span>Type your answer below, or stop this operation.</span>
+              <button className="chatbot-flow-stop" onClick={stopFlow}>Stop</button>
+            </div>
+          )}
+
           <div className="chatbot-input-row">
             <textarea
               className="chatbot-input"
-              placeholder="Ask a question..."
+              placeholder={flow ? "Type your answer..." : "Ask a question..."}
               value={input}
               onChange={e => setInput(e.target.value)}
               onKeyDown={handleKeyDown}

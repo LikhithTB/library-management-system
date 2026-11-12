@@ -218,6 +218,66 @@
   color: var(--text-muted);
 }
 
+/* ── Guided operations (student menu and flow steps) ── */
+
+.chatbot-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.chatbot-option {
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--primary);
+  background: var(--surface-strong);
+  color: var(--primary);
+  font-size: 12px;
+  font-weight: 700;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.chatbot-option:hover:not(:disabled) {
+  background: var(--primary-soft);
+}
+
+.chatbot-option:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.chatbot-flow-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--primary-soft);
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.chatbot-flow-stop {
+  padding: 4px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-strong);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.chatbot-flow-stop:hover {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
 .chatbot-input-row {
   display: flex;
   align-items: flex-end;
