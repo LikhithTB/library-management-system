@@ -198,6 +198,8 @@ function ReviewSection({ bookId, userId }) {
   useEffect(() => {
     fetchReviews();
     fetchMyReview();
+  // Intentional: re-fetch only when the book changes. Adding the helper to the list would re-run it on every render.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bookId]);
 
   const fetchReviews = async () => {
@@ -353,6 +355,8 @@ export default function StudentHome({ user, onNavigate }) {
   useEffect(() => {
     fetchStudentData();
     fetchRecommendations();
+  // Intentional: load once on mount. Adding the helper to the list would re-run it on every render.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const fetchStudentData = async () => {

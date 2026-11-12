@@ -259,6 +259,8 @@ function HODBookRequests({ user }) {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
 
+  // Intentional: re-fetch only when the filter changes. Adding the helper to the list would re-run it on every render.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { fetchRequests(); }, [filter]);
 
   const fetchRequests = async () => {
