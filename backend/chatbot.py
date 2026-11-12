@@ -17,6 +17,14 @@ Trust levels served here:
     limits, waiting queues, fines) applies exactly as it does in the normal
     UI. The model never executes anything itself.
 
+  - Librarian, per-student menu: typing a student's roll number returns the
+    operations possible for that student right now (issue, return, renew,
+    collect fine, resolve lost/damaged, NOC, summary) via
+    /api/chatbot/student-menu. Choosing one walks through
+    /api/chatbot/student-flow step by step, and the last step is the same
+    Confirm card. The menu and the flow compute availability from the
+    database directly, not from the model.
+
   - Student: two read-only tools. "run_catalog_query" (public catalog views
     only) and "get_my_library_status" (fixed query scoped to the student's
     own roll number — never model-controlled).
@@ -36,28 +44,34 @@ import json
 import logging
 import os
 import re
+from datetime import datetime
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, func, or_, text
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from urllib.parse import urlparse, urlunparse
 
+import models
+from config import MAX_FREE_RENEWALS, RENEWAL_EARLY_DAYS, RENEWAL_WINDOW_DAYS
 from database import get_db
+from models import AccountStatus, CopyStatus, NotificationStatus, RoleEnum
+import auth
 
 logger = logging.getLogger("chatbot")
 
 router = APIRouter()
+# Routes below require a valid, approved login (see auth.get_current_user).
+protected = APIRouter(dependencies=[Depends(auth.get_current_user)])
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 CHATBOT_MODEL = os.environ.get("OPENAI_CHATBOT_MODEL", "gpt-4.1-nano")
 
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL", "postgresql://postgres:0567@localhost:5432/library_db"
-)
-CHATBOT_DB_PASSWORD = os.environ.get("CHATBOT_DB_PASSWORD", "chatbot_dev_only")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+CHATBOT_DB_PASSWORD = os.environ.get("CHATBOT_DB_PASSWORD", "")
+CHATBOT_STUDENT_DB_PASSWORD = os.environ.get("CHATBOT_STUDENT_DB_PASSWORD", "")
 
 ALLOWED_ROLES = {"librarian", "hod", "student"}
 
@@ -94,28 +108,39 @@ PROPOSE_TOOL_NAMES = {
 }
 
 
-def _build_chatbot_engine():
-    """Read-only engine, using the same host/db as the main app but the
-    restricted chatbot_ro credentials instead of the admin ones.
+_engines = {}
 
-    The psycopg2 driver is forced explicitly in the URL (see database.py
-    for the same fix and why: newer SQLAlchemy releases can resolve a bare
-    "postgresql://" URL to the psycopg v3 driver by default, which isn't
-    installed here — only psycopg2-binary is)."""
+
+def _build_chatbot_engine(username: str, password: str):
+    """Read-only engine on the same host and database as the main app, logged in
+    as a restricted chatbot role. Sessions are also forced read-only at the
+    connection level, as a second line of defence after validate_sql."""
+    if not password:
+        raise RuntimeError("Chatbot database password is not configured.")
     parsed = urlparse(DATABASE_URL)
-    ro_netloc = f"chatbot_ro:{CHATBOT_DB_PASSWORD}@{parsed.hostname}:{parsed.port or 5432}"
-    ro_url = urlunparse(parsed._replace(netloc=ro_netloc, scheme="postgresql+psycopg2"))
-    return create_engine(ro_url, pool_pre_ping=True)
+    netloc = f"{username}:{password}@{parsed.hostname}:{parsed.port or 5432}"
+    url = urlunparse(parsed._replace(netloc=netloc, scheme="postgresql+psycopg2"))
+    return create_engine(
+        url,
+        pool_pre_ping=True,
+        connect_args={"options": "-c default_transaction_read_only=on"},
+    )
 
 
-_engine = None
+def _engine_for(username: str, password: str):
+    if username not in _engines:
+        _engines[username] = _build_chatbot_engine(username, password)
+    return _engines[username]
 
 
 def get_chatbot_engine():
-    global _engine
-    if _engine is None:
-        _engine = _build_chatbot_engine()
-    return _engine
+    """Staff-level curated views (librarian and HOD questions)."""
+    return _engine_for("chatbot_ro", CHATBOT_DB_PASSWORD)
+
+
+def get_student_chatbot_engine():
+    """Students can reach only the catalogue views granted to chatbot_student_ro."""
+    return _engine_for("chatbot_student_ro", CHATBOT_STUDENT_DB_PASSWORD)
 
 
 STAFF_SCHEMA_DESCRIPTION = """
@@ -414,10 +439,12 @@ class ChatbotRequest(BaseModel):
 
 class PendingAction(BaseModel):
     """A fully-resolved action waiting for the librarian's confirmation."""
-    action: str                      # "issue" | "return" | "renew"
+    action: str                      # "issue" | "return" | "renew" | "collect_fine" | "resolve_damage"
     copy_code: str
     roll_number: Optional[str] = None
     summary: str
+    fine_id: Optional[int] = None    # collect_fine only
+    resolution: Optional[str] = None  # resolve_damage only: "replace" | "pay"
 
 
 class ChatbotResponse(BaseModel):
@@ -431,6 +458,8 @@ class ExecuteActionRequest(BaseModel):
     copy_code: str
     roll_number: Optional[str] = None
     user_id: int                     # the librarian performing the action
+    fine_id: Optional[int] = None    # collect_fine
+    resolution: Optional[str] = None  # resolve_damage: "replace" | "pay"
 
 
 class ExecuteActionResponse(BaseModel):
@@ -473,8 +502,8 @@ def validate_sql(query: str, allowed_views: set) -> str:
     return q
 
 
-def run_query(query: str):
-    engine = get_chatbot_engine()
+def run_query(query: str, engine=None):
+    engine = engine or get_chatbot_engine()
     with engine.connect() as conn:
         result = conn.execute(text(query))
         rows = result.mappings().all()
@@ -492,7 +521,9 @@ def run_my_library_status(roll_number: str):
     and the two are easy to conflate if only one is ever fetched.
     """
     engine = get_chatbot_engine()
-    roll_pattern = f"%{roll_number}%"
+    # Exact event phrases, so roll "CS001" never matches "CS0012".
+    issued_needle = f" issued to {roll_number}."
+    renewed_needle = f" renewed by {roll_number}."
 
     with engine.connect() as conn:
         issued = conn.execute(
@@ -537,20 +568,20 @@ def run_my_library_status(roll_number: str):
             text("""
                 SELECT book_title, changed_at
                 FROM v_book_history
-                WHERE change_type = 'issued' AND change_detail ILIKE :pattern
+                WHERE change_type = 'issued' AND POSITION(LOWER(:needle) IN LOWER(change_detail)) > 0
                 LIMIT 200
             """),
-            {"pattern": roll_pattern},
+            {"needle": issued_needle},
         ).mappings().all()
 
         renewed_events = conn.execute(
             text("""
                 SELECT book_title, changed_at
                 FROM v_book_history
-                WHERE change_type = 'renewed' AND change_detail ILIKE :pattern
+                WHERE change_type = 'renewed' AND POSITION(LOWER(:needle) IN LOWER(change_detail)) > 0
                 LIMIT 200
             """),
-            {"pattern": roll_pattern},
+            {"needle": renewed_needle},
         ).mappings().all()
 
         distinct_books = {row["book_title"] for row in issued_events}
@@ -780,8 +811,8 @@ def build_pending_action(tool_name: str, args: dict):
 # Librarian actions — step 2: EXECUTE (only after the librarian confirms)
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.post("/api/chatbot/execute-action", response_model=ExecuteActionResponse)
-def execute_action(req: ExecuteActionRequest, db: Session = Depends(get_db)):
+@protected.post("/api/chatbot/execute-action", response_model=ExecuteActionResponse)
+def execute_action(req: ExecuteActionRequest, db: Session = Depends(get_db), current: models.User = Depends(auth.require_roles(RoleEnum.librarian))):
     """Runs a confirmed circulation action by calling the app's EXISTING
     issue / return / renew functions, so every existing business rule
     applies unchanged. The caller must be a real, approved librarian."""
@@ -789,9 +820,8 @@ def execute_action(req: ExecuteActionRequest, db: Session = Depends(get_db)):
     import schemas
     from models import RoleEnum
 
-    librarian = db.query(models.User).filter(models.User.id == req.user_id).first()
-    if not librarian or librarian.role != RoleEnum.librarian or not librarian.is_approved:
-        raise HTTPException(status_code=403, detail="Only librarian accounts can run chatbot actions.")
+    # The acting librarian comes from the login token, never from the request body.
+    librarian = current
 
     # Imported here (not at the top) because main.py imports this module while
     # it is itself still loading; by the time a request arrives, it's loaded.
@@ -807,7 +837,7 @@ def execute_action(req: ExecuteActionRequest, db: Session = Depends(get_db)):
             result = app_main.issue_book(
                 schemas.IssueRequest(copy_code=req.copy_code, roll_number=req.roll_number,
                                      librarian_id=librarian.id),
-                db,
+                db, current=librarian,
             )
             message = (f"Issued copy {result['copy_code']} to {req.roll_number}. "
                        f"Due {_fmt_date(result.get('due_date'))}.")
@@ -816,7 +846,7 @@ def execute_action(req: ExecuteActionRequest, db: Session = Depends(get_db)):
             result = app_main.return_book(
                 schemas.ReturnRequest(copy_code=req.copy_code, librarian_id=librarian.id,
                                       condition="good"),
-                db,
+                db, current=librarian,
             )
             message = result.get("message", "Book returned.").rstrip(".") + "."
             if result.get("fine"):
@@ -833,11 +863,37 @@ def execute_action(req: ExecuteActionRequest, db: Session = Depends(get_db)):
                 raise HTTPException(status_code=400, detail="Couldn't find the student who has this copy.")
             # The existing renew logic acts on behalf of the borrowing student.
             result = app_main.renew_book(
-                schemas.RenewRequest(copy_code=req.copy_code, user_id=borrower.id), db
+                schemas.RenewRequest(copy_code=req.copy_code, user_id=borrower.id), db, current=librarian,
             )
             message = result.get("message", "Book renewed.")
             if "renewals_left" in result:
                 message += f" ({result['renewals_left']} renewal(s) left.)"
+
+        elif req.action == "collect_fine":
+            fine = db.query(models.FineRecord).filter(models.FineRecord.id == req.fine_id).first()
+            if not fine:
+                raise HTTPException(status_code=404, detail="That fine no longer exists.")
+            # Full remaining amount, read fresh from the DB, so collect_fine's
+            # "must match remaining exactly" rule always passes for this fine.
+            result = app_main.collect_fine(
+                schemas.FinePayment(fine_id=fine.id, roll_number=fine.roll_number,
+                                    amount_paid=fine.remaining, recorded_by=librarian.id),
+                db, current=librarian,
+            )
+            message = result["message"]
+            if result.get("student_unblocked"):
+                message += " The student has been unblocked."
+
+        elif req.action == "resolve_damage":
+            if not req.roll_number:
+                raise HTTPException(status_code=400, detail="A student roll number is required.")
+            if req.resolution not in ("replace", "pay"):
+                raise HTTPException(status_code=400, detail="Resolution must be 'replace' or 'pay'.")
+            result = app_main.resolve_damage_loss(
+                copy_code=req.copy_code, roll_number=req.roll_number,
+                resolution=req.resolution, librarian_id=librarian.id, db=db, current=librarian,
+            )
+            message = result["message"]
 
         else:
             raise HTTPException(status_code=400, detail="Unknown action.")
@@ -855,6 +911,408 @@ def execute_action(req: ExecuteActionRequest, db: Session = Depends(get_db)):
     return ExecuteActionResponse(ok=True, message=message)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Librarian: per-student menu and guided operations
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# A librarian types a student's roll number. The menu lists ONLY the operations
+# that are possible for that student right now, using the same rules the normal
+# screens enforce. Picking one opens a short guided flow (pick a book / fine /
+# option, or type a title). Every flow ends in the same propose-then-confirm
+# card as above, so nothing changes until the librarian presses Confirm, which
+# goes through /api/chatbot/execute-action and the app's existing functions.
+#
+# The flow is stateless: the frontend sends the operation and the selection so
+# far on every step, and every step re-checks the rules from scratch.
+
+OP_ISSUE = "issue"
+OP_RETURN = "return"
+OP_RENEW = "renew"
+OP_COLLECT_FINE = "collect_fine"
+OP_RESOLVE_DAMAGE = "resolve_damage"
+OP_NOC = "noc"
+OP_SUMMARY = "summary"
+
+OPERATION_LABELS = {
+    OP_ISSUE: "Issue a book",
+    OP_RETURN: "Return a book",
+    OP_RENEW: "Renew a book",
+    OP_COLLECT_FINE: "Collect a fine",
+    OP_RESOLVE_DAMAGE: "Resolve a lost / damaged book",
+    OP_NOC: "Generate No-Dues (NOC) certificate",
+    OP_SUMMARY: "Show account summary",
+}
+
+
+class MenuRequest(BaseModel):
+    roll_number: str
+    user_id: int                     # the librarian asking
+
+
+class MenuOperation(BaseModel):
+    key: str
+    label: str
+
+
+class StudentMenuResponse(BaseModel):
+    is_student: bool
+    roll_number: str
+    message: str
+    operations: List[MenuOperation] = []
+
+
+class StudentFlowRequest(BaseModel):
+    user_id: int                     # the librarian performing the flow
+    roll_number: str
+    operation: str
+    selection: Optional[str] = None  # None = first step; otherwise the choice / typed answer
+
+
+class FlowChoice(BaseModel):
+    label: str
+    value: str
+
+
+class FlowDownload(BaseModel):
+    kind: str                        # "noc"
+    roll_number: str
+
+
+class StudentFlowResponse(BaseModel):
+    message: str
+    choices: List[FlowChoice] = []
+    awaiting_text: bool = False      # True = the next thing the librarian types is the answer
+    pending_action: Optional[PendingAction] = None
+    download: Optional[FlowDownload] = None
+
+
+def _require_librarian(db: Session, user_id: int):
+    librarian = db.query(models.User).filter(models.User.id == user_id).first()
+    if not librarian or librarian.role != RoleEnum.librarian or not librarian.is_approved:
+        raise HTTPException(status_code=403, detail="Only librarian accounts can use chatbot actions.")
+    return librarian
+
+
+def _get_student(db: Session, roll: str):
+    return db.query(models.User).filter(
+        func.lower(models.User.roll_number) == roll.lower(),
+        models.User.role == RoleEnum.student,
+    ).first()
+
+
+def _issued_copies(db: Session, roll: str):
+    return db.query(models.BookCopy).filter(
+        models.BookCopy.issued_to_roll == roll,
+        models.BookCopy.status == CopyStatus.issued,
+    ).order_by(models.BookCopy.due_date).all()
+
+
+def _open_fines(db: Session, roll: str):
+    return db.query(models.FineRecord).filter(
+        models.FineRecord.roll_number == roll,
+        models.FineRecord.is_cleared == False,  # noqa: E712
+        models.FineRecord.remaining > 0,
+    ).order_by(models.FineRecord.created_at).all()
+
+
+def _renew_state(db: Session, copy) -> str:
+    """Mirrors the rules in renew_book (and get_student_issued's renew_status).
+    Only "can_renew" means the renew button should be offered."""
+    if not copy.due_date:
+        return "not_eligible"
+    now = datetime.utcnow()
+    due = copy.due_date.replace(tzinfo=None) if getattr(copy.due_date, "tzinfo", None) else copy.due_date
+    if due < now:
+        return "overdue"
+    if copy.renewal_count >= MAX_FREE_RENEWALS:
+        return "max_reached"
+    waiting = db.query(models.BookNotification).filter(
+        models.BookNotification.book_id == copy.book_id,
+        models.BookNotification.status == NotificationStatus.waiting,
+    ).count()
+    if waiting > 0:
+        return "blocked_by_queue"
+    if (due - now).days <= RENEWAL_EARLY_DAYS:
+        return "can_renew"
+    return "too_early"
+
+
+def _open_damage_copies(db: Session, roll: str):
+    """(fine, copy) pairs for lost/damaged books that still need a decision
+    (replace or pay). Once a decision is recorded it drops off this list; a
+    'pay' decision then shows up under Collect a fine instead."""
+    results = []
+    for fine in _open_fines(db, roll):
+        if not fine.copy_code:
+            continue
+        copy = db.query(models.BookCopy).filter(models.BookCopy.copy_code == fine.copy_code).first()
+        if not copy or copy.status not in (CopyStatus.lost, CopyStatus.damaged):
+            continue
+        decided = db.query(models.BookHistory).filter(
+            models.BookHistory.book_id == copy.book_id,
+            models.BookHistory.change_type.in_(["resolution_pay", "resolution_replace"]),
+            or_(
+                models.BookHistory.change_detail.contains(f"copy {copy.copy_code}."),
+                models.BookHistory.change_detail.contains(f"copy {copy.copy_code} "),
+            ),
+        ).first()
+        if decided:
+            continue
+        results.append((fine, copy))
+    return results
+
+
+def _noc_eligible(db: Session, roll: str) -> bool:
+    import main as app_main  # lazy: main imports this module while loading
+    try:
+        return app_main.check_noc_eligibility(roll_number=roll, db=db)["eligible"]
+    except HTTPException:
+        return False
+
+
+def _available_operations(db: Session, student) -> List[str]:
+    """Every operation that makes sense for this student at this moment."""
+    roll = student.roll_number
+    ops = []
+
+    if student.is_approved and not student.is_blocked and student.account_status == AccountStatus.active:
+        ops.append(OP_ISSUE)
+
+    issued = _issued_copies(db, roll)
+    if issued:
+        ops.append(OP_RETURN)
+        if any(_renew_state(db, c) == "can_renew" for c in issued):
+            ops.append(OP_RENEW)
+
+    if _open_fines(db, roll):
+        ops.append(OP_COLLECT_FINE)
+    if _open_damage_copies(db, roll):
+        ops.append(OP_RESOLVE_DAMAGE)
+    if _noc_eligible(db, roll):
+        ops.append(OP_NOC)
+
+    ops.append(OP_SUMMARY)  # always available: it only reads
+    return ops
+
+
+def _choose(message: str, options) -> StudentFlowResponse:
+    """options: list of (label, value)."""
+    if not options:
+        return StudentFlowResponse(message="There's nothing to choose from right now.")
+    return StudentFlowResponse(
+        message=message,
+        choices=[FlowChoice(label=label, value=value) for label, value in options],
+    )
+
+
+def _from_outcome(outcome) -> StudentFlowResponse:
+    """Turns build_pending_action's result (PendingAction or a sentence) into a step."""
+    if isinstance(outcome, PendingAction):
+        return StudentFlowResponse(message=outcome.summary, pending_action=outcome)
+    return StudentFlowResponse(message=outcome)
+
+
+def _copy_label(copy) -> str:
+    return f"{copy.book.title} — {copy.copy_code}"
+
+
+def _flow_issue(db: Session, roll: str, sel: Optional[str]) -> StudentFlowResponse:
+    if not sel:
+        return StudentFlowResponse(
+            message=f"Which book should I issue to {roll}? Type its title or copy code.",
+            awaiting_text=True,
+        )
+    # Copy codes look like BK-13425678904-260608-01; anything else is treated as a title.
+    is_code = bool(re.fullmatch(r"[A-Za-z]{2}-\d[\w-]*", sel))
+    args = {"roll_number": roll, "copy_code": sel} if is_code else {"roll_number": roll, "book_title": sel}
+    outcome = build_pending_action(PROPOSE_ISSUE_TOOL_NAME, args)
+    if isinstance(outcome, PendingAction):
+        return _from_outcome(outcome)
+    # Couldn't resolve (no match, several matches, no free copy): ask again.
+    return StudentFlowResponse(message=outcome, awaiting_text=True)
+
+
+def _flow_return(db: Session, roll: str, sel: Optional[str]) -> StudentFlowResponse:
+    copies = _issued_copies(db, roll)
+    if not sel:
+        return _choose(
+            f"Which book is {roll} returning? It will be checked in as returned in good condition. "
+            f"Lost or damaged returns are recorded from the Return screen.",
+            [(_copy_label(c), c.copy_code) for c in copies],
+        )
+    if sel not in {c.copy_code for c in copies}:
+        return StudentFlowResponse(message=f"{sel} isn't a book {roll} currently has issued.")
+    outcome = build_pending_action(PROPOSE_RETURN_TOOL_NAME,
+                                   {"roll_number": roll, "copy_code": sel, "condition": "good"})
+    return _from_outcome(outcome)
+
+
+def _flow_renew(db: Session, roll: str, sel: Optional[str]) -> StudentFlowResponse:
+    renewable = [c for c in _issued_copies(db, roll) if _renew_state(db, c) == "can_renew"]
+    if not sel:
+        return _choose(
+            f"Which book should I renew for {roll}? Renewal adds {RENEWAL_WINDOW_DAYS} days to the due date.",
+            [(f"{_copy_label(c)} (due {_fmt_date(c.due_date)})", c.copy_code) for c in renewable],
+        )
+    if sel not in {c.copy_code for c in renewable}:
+        return StudentFlowResponse(message="That book can't be renewed right now.")
+    outcome = build_pending_action(PROPOSE_RENEW_TOOL_NAME, {"roll_number": roll, "copy_code": sel})
+    return _from_outcome(outcome)
+
+
+def _flow_collect(db: Session, roll: str, sel: Optional[str]) -> StudentFlowResponse:
+    fines = _open_fines(db, roll)
+    if not sel:
+        return _choose(
+            f"Which fine should {roll} pay? Only full payment is accepted. "
+            f"Overdue fines on books still out are added when the book is returned.",
+            [(f"Rs. {f.remaining:.2f} — {f.book_title or f.copy_code or 'fine'}", str(f.id)) for f in fines],
+        )
+    fine = next((f for f in fines if str(f.id) == sel), None)
+    if not fine:
+        return StudentFlowResponse(message="That fine isn't open any more.")
+    title = f" for “{fine.book_title}”" if fine.book_title else ""
+    summary = (f"Collect the full payment of Rs. {fine.remaining:.2f} from {roll}{title}. "
+               f"The student is unblocked if no other fines remain.")
+    pending = PendingAction(action="collect_fine", copy_code=fine.copy_code or "",
+                            roll_number=roll, summary=summary, fine_id=fine.id)
+    return _from_outcome(pending)
+
+
+def _flow_resolve(db: Session, roll: str, sel: Optional[str]) -> StudentFlowResponse:
+    pairs = _open_damage_copies(db, roll)
+    if not sel:
+        return _choose(
+            f"Which lost or damaged book is {roll} settling?",
+            [(_copy_label(copy), copy.copy_code) for _, copy in pairs],
+        )
+
+    resolution, _, code = sel.rpartition(":")  # "replace:CODE" / "pay:CODE" / "CODE"
+    copy = next((c for _, c in pairs if c.copy_code == code), None)
+    if not copy:
+        return StudentFlowResponse(message="That book doesn't need a decision right now.")
+
+    if resolution not in ("replace", "pay"):
+        cost = copy.book.replacement_cost
+        return _choose(
+            f"How should {roll} settle “{copy.book.title}” ({copy.copy_code})?",
+            [
+                ("Replace with a new copy of the same edition", f"replace:{copy.copy_code}"),
+                (f"Pay the replacement cost (Rs. {cost:.2f})", f"pay:{copy.copy_code}"),
+            ],
+        )
+
+    if resolution == "replace":
+        summary = (f"Accept a replacement copy of “{copy.book.title}” ({copy.copy_code}) from {roll}. "
+                   f"The fine is cleared and the student is unblocked. You still need to add the "
+                   f"new physical copy to the system.")
+    else:
+        summary = (f"Record that {roll} will pay Rs. {copy.book.replacement_cost:.2f} for "
+                   f"“{copy.book.title}” ({copy.copy_code}). Collect it from Collect a fine; the "
+                   f"student stays blocked until it's paid.")
+    pending = PendingAction(action="resolve_damage", copy_code=copy.copy_code, roll_number=roll,
+                            summary=summary, resolution=resolution)
+    return _from_outcome(pending)
+
+
+def _flow_noc(db: Session, roll: str) -> StudentFlowResponse:
+    import main as app_main  # lazy: see _noc_eligible
+    result = app_main.check_noc_eligibility(roll_number=roll, db=db)
+    if not result["eligible"]:
+        return StudentFlowResponse(
+            message=f"{roll} isn't eligible for a NOC yet: " + "; ".join(result["blocking_reasons"]) + "."
+        )
+    return StudentFlowResponse(
+        message=f"{roll} is eligible for a No-Dues (NOC) certificate.",
+        download=FlowDownload(kind="noc", roll_number=roll),
+    )
+
+
+def _flow_summary(db: Session, student) -> StudentFlowResponse:
+    roll = student.roll_number
+    issued = _issued_copies(db, roll)
+    reserved = db.query(models.BookCopy).filter(
+        models.BookCopy.reserved_by_roll == roll,
+        models.BookCopy.status == CopyStatus.reserved,
+    ).all()
+    fines = _open_fines(db, roll)
+
+    lines = [
+        f"Account summary for {roll}",
+        f"Account status: {student.account_status.value}. Blocked: {'yes' if student.is_blocked else 'no'}.",
+    ]
+    if issued:
+        lines.append(f"Books issued ({len(issued)}):")
+        lines += [f"• {c.book.title} — due {_fmt_date(c.due_date)}" for c in issued]
+    else:
+        lines.append("Books issued: none.")
+    if reserved:
+        lines.append(f"Reserved ({len(reserved)}): " + "; ".join(c.book.title for c in reserved))
+    if fines:
+        lines.append(f"Unpaid fines: Rs. {sum(f.remaining for f in fines):.2f} across {len(fines)} record(s).")
+    else:
+        lines.append("Unpaid fines: none.")
+    return StudentFlowResponse(message="\n".join(lines))
+
+
+@protected.post("/api/chatbot/student-menu", response_model=StudentMenuResponse)
+def student_menu(req: MenuRequest, db: Session = Depends(get_db), current: models.User = Depends(auth.require_roles(RoleEnum.librarian))):
+    """Called when a librarian types a roll number. Returns the operations that
+    are possible for that student right now. is_student=False means the number
+    isn't a student, and the chat should treat the text as an ordinary question."""
+    roll = _clean(req.roll_number) or ""
+    student = _get_student(db, roll) if roll else None
+    if not student:
+        return StudentMenuResponse(is_student=False, roll_number=roll,
+                                   message=f"I couldn't find a student with roll number {roll}.")
+    return StudentMenuResponse(
+        is_student=True,
+        roll_number=student.roll_number,
+        message=f"What would you like to do for {student.roll_number}?",
+        operations=[MenuOperation(key=k, label=OPERATION_LABELS[k])
+                    for k in _available_operations(db, student)],
+    )
+
+
+@protected.post("/api/chatbot/student-flow", response_model=StudentFlowResponse)
+def student_flow(req: StudentFlowRequest, db: Session = Depends(get_db), current: models.User = Depends(auth.require_roles(RoleEnum.librarian))):
+    """One step of a guided operation. Never changes anything itself: the last
+    step returns a pending_action, which the librarian confirms separately."""
+    student = _get_student(db, req.roll_number)
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+    if req.operation not in OPERATION_LABELS:
+        raise HTTPException(status_code=400, detail="Unknown operation.")
+
+    roll = student.roll_number
+    sel = _clean(req.selection)
+
+    if req.operation not in _available_operations(db, student):
+        return StudentFlowResponse(
+            message=f"{OPERATION_LABELS[req.operation]} isn't available for {roll} right now."
+        )
+
+    try:
+        if req.operation == OP_ISSUE:
+            return _flow_issue(db, roll, sel)
+        if req.operation == OP_RETURN:
+            return _flow_return(db, roll, sel)
+        if req.operation == OP_RENEW:
+            return _flow_renew(db, roll, sel)
+        if req.operation == OP_COLLECT_FINE:
+            return _flow_collect(db, roll, sel)
+        if req.operation == OP_RESOLVE_DAMAGE:
+            return _flow_resolve(db, roll, sel)
+        if req.operation == OP_NOC:
+            return _flow_noc(db, roll)
+        return _flow_summary(db, student)
+    except SQLAlchemyError as exc:
+        logger.exception("Student flow step failed")
+        if _is_db_connection_problem(exc):
+            raise HTTPException(status_code=503, detail=DB_LOGIN_HELP)
+        return StudentFlowResponse(message="I couldn't look that up right now. Please try again in a moment.")
+
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Readable failures
@@ -866,9 +1324,8 @@ def execute_action(req: ExecuteActionRequest, db: Session = Depends(get_db)):
 # backend log).
 
 DB_LOGIN_HELP = (
-    "The chatbot couldn't connect to its read-only database account (chatbot_ro). "
-    "Run: docker exec -it library-backend python setup_chatbot_db.py  and then  "
-    "docker compose restart backend."
+    "The chatbot is temporarily unavailable because its database connection is not "
+    "working. Please ask an administrator to check the chatbot database setup."
 )
 
 
@@ -884,23 +1341,24 @@ def _is_db_connection_problem(exc: Exception) -> bool:
 
 
 def _describe_openai_error(exc: Exception) -> str:
+    """Maps SDK errors to a short message. Details go to the server log only."""
     try:
         import openai
     except ImportError:
-        return f"Unexpected error talking to OpenAI: {exc}"
+        return "The AI assistant is unavailable right now."
     if isinstance(exc, openai.AuthenticationError):
-        return "OpenAI rejected the API key. Check OPENAI_API_KEY in your .env, then restart the backend."
+        return "The AI assistant is not configured correctly. Please contact an administrator."
     if isinstance(exc, openai.PermissionDeniedError):
-        return "OpenAI denied access for this key (it may not be allowed to use this model)."
+        return "The AI assistant is not permitted to answer right now. Please contact an administrator."
     if isinstance(exc, openai.RateLimitError):
-        return "OpenAI reports the rate limit or quota was reached. Check the credits/billing on your OpenAI account."
+        return "The AI assistant is busy. Please try again in a moment."
     if isinstance(exc, openai.NotFoundError):
-        return f"OpenAI doesn't recognise the model '{CHATBOT_MODEL}' for this key. Check OPENAI_CHATBOT_MODEL in your .env."
+        return "The AI assistant is not configured correctly. Please contact an administrator."
     if isinstance(exc, openai.BadRequestError):
-        return f"OpenAI rejected the request: {getattr(exc, 'message', exc)}"
+        return "The AI assistant could not process that request. Try rephrasing it."
     if isinstance(exc, (openai.APIConnectionError, openai.APITimeoutError)):
-        return "The backend couldn't reach OpenAI (network problem or timeout)."
-    return f"OpenAI error: {exc}"
+        return "The AI assistant could not be reached. Please try again."
+    return "The AI assistant hit an unexpected error. Please try again."
 
 
 def _complete(client, **kwargs):
@@ -916,6 +1374,12 @@ def _complete(client, **kwargs):
 
 @router.get("/api/chatbot/health")
 def chatbot_health():
+    """Liveness check for Docker. Deliberately reveals no configuration."""
+    return {"status": "ok"}
+
+
+@protected.get("/api/chatbot/health/details", dependencies=[Depends(auth.require_roles(RoleEnum.admin))])
+def chatbot_health_details():
     """Quick self-check — open http://localhost:8000/api/chatbot/health.
     Doesn't call OpenAI (so it costs nothing); reports whether a key is
     configured, which model is set, and whether the read-only database
@@ -962,7 +1426,7 @@ def _handle_tool_call(tool_call, req: ChatbotRequest):
     if name == RUN_CATALOG_TOOL_NAME:
         args = json.loads(tool_call.function.arguments)
         safe_query = validate_sql(args["query"], STUDENT_ALLOWED_VIEWS)
-        return run_query(safe_query), safe_query
+        return run_query(safe_query, get_student_chatbot_engine()), safe_query
 
     if name == MY_STATUS_TOOL_NAME:
         if not req.roll_number:
@@ -972,8 +1436,12 @@ def _handle_tool_call(tool_call, req: ChatbotRequest):
     raise ValueError(f"Unknown tool '{name}'.")
 
 
-@router.post("/api/chatbot/ask", response_model=ChatbotResponse)
-def ask_chatbot(req: ChatbotRequest):
+@protected.post("/api/chatbot/ask", response_model=ChatbotResponse)
+def ask_chatbot(req: ChatbotRequest, current: models.User = Depends(auth.get_current_user)):
+    # Identity is taken from the authenticated account. The client-sent role and
+    # roll number are ignored, so one student can't ask about another student.
+    req.role = current.role.value
+    req.roll_number = current.roll_number
     if req.role not in ALLOWED_ROLES:
         raise HTTPException(status_code=403, detail="Chatbot is only available to student, librarian, and HOD accounts.")
     if req.role == "student" and not req.roll_number:
@@ -1070,3 +1538,7 @@ def ask_chatbot(req: ChatbotRequest):
         answer="I wasn't able to safely answer that question — try rephrasing it.",
         sql=None,
     )
+
+
+# Mount the protected chatbot routes on the router main.py includes.
+router.include_router(protected)

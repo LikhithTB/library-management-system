@@ -448,7 +448,7 @@ function AdminSettings({ user }) {
         <div style={{ marginTop: "16px", display: "flex", gap: "8px", flexWrap: "wrap" }}>
           {[1, 2, 5, 10, 20, 50].map(p => (
             <button key={p}
-              className={finePerDay == p ? "approve-btn" : "logout-btn"}
+              className={String(finePerDay) === String(p) ? "approve-btn" : "logout-btn"}
               style={{ fontSize: "12px", padding: "5px 12px" }}
               onClick={() => setFinePerDay(String(p))}>
               Rs. {p}

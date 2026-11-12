@@ -46,6 +46,14 @@ else
     echo "=================================================================="
 fi
 
+echo "Upgrading any legacy plaintext passwords to hashes (if needed)..."
+if python migrate_password_hashes.py; then
+    echo "Password hash migration: OK"
+else
+    echo "WARNING: password hash migration failed. Legacy passwords stay plaintext until it succeeds."
+    echo "Retry with: docker exec -it library-backend python migrate_password_hashes.py"
+fi
+
 echo "Applying account_status migration (if needed)..."
 if python migrate_account_status.py; then
     echo "Account status migration: OK"

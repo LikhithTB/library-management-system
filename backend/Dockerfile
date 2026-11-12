@@ -10,7 +10,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the rest of the backend source
 COPY . .
 
-RUN chmod +x entrypoint.sh
+RUN chmod +x entrypoint.sh \
+    && useradd --create-home --uid 10001 appuser \
+    && chown -R appuser:appuser /app
+
+# Don't run the API as root.
+USER appuser
 
 EXPOSE 8000
 

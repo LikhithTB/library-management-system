@@ -13,7 +13,9 @@ _engine_url = DATABASE_URL
 if _engine_url.startswith("postgresql://"):
     _engine_url = _engine_url.replace("postgresql://", "postgresql+psycopg2://", 1)
 
-engine = create_engine(_engine_url)
+# pool_pre_ping: test each pooled connection before use, so a database restart
+# does not leave the app handing out dead connections (500 errors).
+engine = create_engine(_engine_url, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 

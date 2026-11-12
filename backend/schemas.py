@@ -1,17 +1,17 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from typing import Optional
 from models import RoleEnum, ApprovalStatus, AccountStatus, BookType, CopyStatus, MediaType, NotificationStatus, OverrideStatus
 from datetime import datetime
 
 class RegisterRequest(BaseModel):
-    roll_number: str
+    roll_number: str = Field(min_length=1, max_length=50)
     email: EmailStr
-    password: str
+    password: str = Field(min_length=8, max_length=128)
     role: Optional[RoleEnum] = None
 
 class LoginRequest(BaseModel):
-    roll_number: str
-    password: str
+    roll_number: str = Field(max_length=50)
+    password: str = Field(max_length=128)
 
 class UserOut(BaseModel):
     id: int

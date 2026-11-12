@@ -56,6 +56,13 @@ export default function App() {
     setPage("login");
   };
 
+  // The API returned 401 (session expired, revoked, or account deactivated).
+  useEffect(() => {
+    const onSessionExpired = () => handleLogout();
+    window.addEventListener("lms:session-expired", onSessionExpired);
+    return () => window.removeEventListener("lms:session-expired", onSessionExpired);
+  }, []);
+
   if (page === "dashboard" && user) {
     if (needsGradYear) {
       return (

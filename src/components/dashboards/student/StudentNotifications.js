@@ -64,6 +64,8 @@ function NotificationsTab({ user }) {
 
   useEffect(() => {
     fetchAll();
+  // Intentional: load once on mount. Adding the helper to the list would re-run it on every render.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const fetchAll = async () => {
@@ -193,6 +195,8 @@ function ReadingHistoryTab({ user }) {
       .then(data => setHistory(Array.isArray(data) ? data : []))
       .catch(() => {})
       .finally(() => setLoading(false));
+  // Intentional: load once on mount. Adding the helper to the list would re-run it on every render.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   if (loading) return <div className="empty-state">Loading history...</div>;
@@ -271,6 +275,8 @@ function WishlistTab({ user }) {
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState("");
 
+  // Intentional: load once on mount. Adding the helper to the list would re-run it on every render.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { fetchWishlist(); }, []);
 
   const fetchWishlist = async () => {
@@ -349,6 +355,8 @@ function BookRequestsTab({ user }) {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
 
+  // Intentional: load once on mount. Adding the helper to the list would re-run it on every render.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { fetchRequests(); }, []);
 
   const fetchRequests = async () => {

@@ -5,12 +5,10 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-0567}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-library_db}
     volumes:
       - library_db_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-library_db}"]
       interval: 5s
@@ -23,8 +21,11 @@ services:
     container_name: library-backend
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-0567}@db:5432/${POSTGRES_DB:-library_db}
-      CHATBOT_DB_PASSWORD: ${CHATBOT_DB_PASSWORD:-chatbot_dev_only}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-library_db}
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:?Set AUTH_SECRET_KEY in .env (see .env.example)}
+      ADMIN_INITIAL_PASSWORD: ${ADMIN_INITIAL_PASSWORD:-}
+      CHATBOT_DB_PASSWORD: ${CHATBOT_DB_PASSWORD:?Set CHATBOT_DB_PASSWORD in .env}
+      CHATBOT_STUDENT_DB_PASSWORD: ${CHATBOT_STUDENT_DB_PASSWORD:?Set CHATBOT_STUDENT_DB_PASSWORD in .env}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_CHATBOT_MODEL: ${OPENAI_CHATBOT_MODEL:-gpt-4.1-nano}
     depends_on:
