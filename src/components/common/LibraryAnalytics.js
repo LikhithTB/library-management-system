@@ -179,12 +179,31 @@ function LibraryReports() {
     finally { setLoading(false); }
   };
 
-  const downloadExcel = () => {
+  const downloadExcel = async () => {
     const params = new URLSearchParams({ type: reportType });
     if (dateFrom) params.append("date_from", dateFrom);
     if (dateTo)   params.append("date_to",   dateTo);
     if (course !== "all") params.append("course", course);
-    window.open(`${config.API_URL}/api/reports/hod/export?${params}`, "_blank");
+    try {
+      // Fetched with the login token, then saved; window.open can't send it.
+      const res = await fetch(`${config.API_URL}/api/reports/hod/export?${params}`);
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setError(data.detail || "Failed to export report");
+        return;
+      }
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `${reportType}-report.xlsx`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch {
+      setError("Could not connect to server");
+    }
   };
 
   const selectedType = REPORT_TYPES.find(r => r.id === reportType);

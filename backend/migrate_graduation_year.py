@@ -14,9 +14,9 @@ from urllib.parse import urlparse
 
 import psycopg2
 
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL", "postgresql://postgres:0567@localhost:5432/library_db"
-)
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+if not DATABASE_URL:
+    raise SystemExit("DATABASE_URL is not set.")
 
 
 def main():

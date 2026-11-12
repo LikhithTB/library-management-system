@@ -3,10 +3,11 @@ import os
 APP_NAME = "Library Management System"
 APP_VERSION = "1.0.0"
 
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://postgres:0567@localhost:5432/library_db",
-)
+# No fallback: a real database password must come from the environment
+# (.env / docker-compose). A hardcoded default here would ship in the image.
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set. Copy .env.example to .env and fill it in.")
 
 
 STUDENT_EMAIL_IDENTIFIER = ".stu"
