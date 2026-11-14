@@ -28,7 +28,7 @@ pipeline {
       }
     }
     stage('Database setup') {
-      when { branch 'main' }
+      when { expression { env.GIT_BRANCH == 'origin/main' } }
       environment {
         DATABASE_URL                = credentials('supabase-db-url')
         AUTH_SECRET_KEY             = credentials('auth-secret-key')
@@ -50,7 +50,7 @@ pipeline {
       }
     }
     stage('Deploy backend') {
-      when { branch 'main' }
+      when { expression { env.GIT_BRANCH == 'origin/main' } }
       environment { VERCEL_PROJECT_ID = credentials('vercel-backend-project-id') }
       steps {
         // Run from backend/ so Vercel uses backend/vercel.json and backend/index.py.
@@ -60,7 +60,7 @@ pipeline {
       }
     }
     stage('Deploy frontend') {
-      when { branch 'main' }
+      when { expression { env.GIT_BRANCH == 'origin/main' } }
       environment { VERCEL_PROJECT_ID = credentials('vercel-frontend-project-id') }
       steps {
         sh 'npx --yes vercel deploy --prod --yes --token "$VERCEL_TOKEN"'
