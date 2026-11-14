@@ -1,9 +1,11 @@
+import os
+
 from fastapi import APIRouter, FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_
-from database import Base, engine, get_db
+from database import get_db
 import models, schemas, auth
 from models import RoleEnum, ApprovalStatus, MediaType, BookType, NotificationStatus, CopyStatus, OverrideStatus, AccountStatus
 from config import (
@@ -23,8 +25,6 @@ from config import (
 from datetime import datetime, timedelta
 import io
 
-Base.metadata.create_all(bind=engine)
-
 # Interactive docs and the schema are not served (they list every endpoint).
 app = FastAPI(title=APP_NAME, docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -32,9 +32,18 @@ app = FastAPI(title=APP_NAME, docs_url=None, redoc_url=None, openapi_url=None)
 # login stay on `app` directly. Role/ownership checks sit on each handler.
 api = APIRouter(dependencies=[Depends(auth.get_current_user)])
 
+_frontend_origins = [
+    origin.strip()
+    for origin in os.environ.get(
+        "FRONTEND_ORIGINS", "http://localhost:3000,http://localhost:5173"
+    ).split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=_frontend_origins,
+    allow_origin_regex=os.environ.get("FRONTEND_ORIGIN_REGEX") or None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

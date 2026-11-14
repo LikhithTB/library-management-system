@@ -50,9 +50,9 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import create_engine, func, or_, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
-from urllib.parse import urlparse, urlunparse
 
 import models
 from config import MAX_FREE_RENEWALS, RENEWAL_EARLY_DAYS, RENEWAL_WINDOW_DAYS
@@ -117,13 +117,26 @@ def _build_chatbot_engine(username: str, password: str):
     connection level, as a second line of defence after validate_sql."""
     if not password:
         raise RuntimeError("Chatbot database password is not configured.")
-    parsed = urlparse(DATABASE_URL)
-    netloc = f"{username}:{password}@{parsed.hostname}:{parsed.port or 5432}"
-    url = urlunparse(parsed._replace(netloc=netloc, scheme="postgresql+psycopg2"))
+    db_url = make_url(DATABASE_URL)
+    login = username
+    # Supabase's shared pooler requires the project reference suffix on every
+    # role name (for example, chatbot_ro.<project-ref>).
+    if db_url.host and db_url.host.endswith(".pooler.supabase.com"):
+        base_user = db_url.username or ""
+        if "." in base_user:
+            login = f"{username}.{base_user.rsplit('.', 1)[1]}"
+    url = db_url.set(
+        drivername="postgresql+psycopg2", username=login, password=password
+    )
+    engine_options = {
+        "pool_pre_ping": True,
+        "connect_args": {"options": "-c default_transaction_read_only=on"},
+    }
+    if os.environ.get("VERCEL"):
+        engine_options.update(pool_size=1, max_overflow=0, pool_recycle=300)
     return create_engine(
         url,
-        pool_pre_ping=True,
-        connect_args={"options": "-c default_transaction_read_only=on"},
+        **engine_options,
     )
 
 
