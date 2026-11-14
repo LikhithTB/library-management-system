@@ -1,7 +1,7 @@
 const config = {
   // Keep API requests same-origin. Create React App proxies /api in development,
   // and nginx proxies it to the backend in the Docker deployment.
-  API_URL: process.env.REACT_APP_API_URL || "",
+  API_URL: (process.env.REACT_APP_API_URL || "").trim().replace(/\/+$/, ""),
   APP_NAME: "Library Management System",
   STUDENT_EMAIL_IDENTIFIER: ".stu",
   NON_STUDENT_ROLES: ["librarian", "hod", "staff"],
